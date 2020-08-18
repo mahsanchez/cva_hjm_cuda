@@ -11,13 +11,15 @@
 #include <boost/accumulators/statistics/p_square_quantile.hpp>
 
 #include "simulation.h"
-#include "calibration_libor.h"
 
 using namespace boost::accumulators;
 
 // ATM Market Cap Volatility
-std::vector<double> capvols_mkt = {
-        0.0, 0.1641, 0.1641, 0.1641, 0.1765, 0.1889, 0.2013, 0.2137, 0.2162, 0.2186, 0.2211, 0.2235, 0.2223, 0.2212, 0.2200, 0.2188, 0.2173, 0.2158, 0.2142, 0.2127
+std::vector<double> tenor = {
+        0.0, 0.50, 1.00, 1.50, 2.0, 2.50, 3.0, 3.50, 4.0, 4.50, 5.0, 5.50, 6.0, 6.50, 7.0, 7.50, 8.0, 8.5, 9.0, 9.5, 10.0, 10.50,
+        11, 11.50, 12.0, 12.50, 13.0, 13.50, 14.0, 14.50, 15.0, 15.50, 16.0, 16.50, 17.0, 17.50, 18.0, 18.50, 19.0, 19.50,
+        20.0, 20.50, 21.0, 21.50, 22.0, 22.50, 23.0, 23.50, 24.0, 24.50, 25.0
+
 };
 
 // Zero Coupon Bonds
@@ -47,6 +49,9 @@ std::vector<double> spot_rates = {
 };
 
 // Volatility Calibration
+/*
+ * HJM Calibration (volatilities, drift)
+ */
 std::vector<std::vector<double>> volatilities = //(3, std::vector<double>(51, 0.0));
 {
         {0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,
@@ -142,8 +147,8 @@ void report_statistics(std::vector<cva_stats>& stats_vector, std::vector<std::ve
  */
 
 int main() {
-    const double expiry = 5.0;
-    const double dtau = 0.25;
+    const double expiry = 25.0;
+    const double dtau = 0.5;
 
     /*
      * Interest Rate Swap Product Definition 5Y Floating, 5Y Fixing 3M reset
@@ -156,23 +161,6 @@ int main() {
     };
     InterestRateSwap payOff(floating_schedule, floating_schedule,  fixed_schedule, 10, 0.025, expiry, dtau);
 
-    /*
-     * LMM Calibration (StrippedCapletVolatility, Fitted Instantaneous Volatility, CorrelationMatrix)
-     */
-    std::vector<double> vols;
-    std::vector<std::vector<double>> rho;
-    std::vector<double> spot_rates_;
-    std::vector<double> cplvols;
-
-    // StrippedCapletVolatility
-    StrippedCapletVolatility strippedCapletVolatility(yearFractions0_,yearFractions_, zcb, capvols_mkt, expiry, dtau);
-    strippedCapletVolatility.caps_strikes();
-    strippedCapletVolatility.caplet_volatility_stripping(cplvols, spot_rates_);
-
-    // Parametric Calibration to Cap Prices & Correlation Matrix
-    CplVolCalibration cplVolCalibration(yearFractions, cplvols, expiry); //dtau 1Y
-    cplVolCalibration.calibrate( vols, rho);
-
     /**
      * Monte Carlo Simulation Simulation & Exposure Profiles Generation
      */
@@ -183,7 +171,7 @@ int main() {
     double duration = 0.0;
     int dimension = 3;
     double dt = expiry/simN;
-    int size = expiry/dtau;
+    int size = expiry/dtau + 1;
 
     // Random Number Generation
     int random_count = (1.0/dt) * size * simN;
@@ -256,7 +244,7 @@ int main() {
      */
 
     InterpolatedFICurve zcbCurve(tenor, zcb);
-    InterpolatedFICurve spotRatesCurve(tenor, spot_rates_);
+    InterpolatedFICurve spotRatesCurve(tenor, spot_rates);
     InterpolatedSpreadsCurve spreadsCurve(tenor, spreads, 0.0001);
 
     // Survival Probability Bootstrapping

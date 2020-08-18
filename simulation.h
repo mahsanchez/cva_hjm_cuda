@@ -35,103 +35,6 @@ private:
 
 
 /*
- * LiborMarketModelStochasticProcess
- */
-class LiborMarketModel {
-public:
-
-    LiborMarketModel(std::vector<double> &spot_rates, std::vector<double>& instvol, std::vector<std::vector<double>>& rho_, double dtau_, double expiry_) :
-            volatility(instvol), rho(rho_), dtau(dtau_), expiry(expiry_)
-    {
-        size = instvol.size() + 1;
-        initialize(spot_rates, instvol);
-    }
-
-    // LMM SDE
-    void simulate(double *gaussian_rand) {
-        double vol = 0.0;
-
-        // LMM SDE - CQF Lecture 6 Module 5 p79 Formule 7
-        for (int t = 0; t < size; t++) {
-            for (int i = t + 1; i < size; i++) {
-                double drift = 0.0;
-                for (int k = i; k < size; k++) {
-                    drift =+ (volatility[k-1]  * dtau * fwd_rates[k][t])/ (1 + dtau * fwd_rates[k][t]) * rho[k-1][t];
-                }
-                double vol = volatility[i-1];
-                double dfbar = (-drift * vol - 0.5*vol*vol) * dtau;
-                dfbar += vol * gaussian_rand[t] * std::sqrt(dtau);
-                fwd_rates[i][t+1] = fwd_rates[i][t] * std::exp(dfbar);
-            }
-        }
-        // compute discount factors
-        discount_factors[0][0] = 1.0;
-        for (int t = 0; t < size; t++) {
-            for (int i = t + 1; i < size; i++) {
-                double accuml = 1.0;
-                for (int k = t; k < i; k++) {
-                    accuml *= 1 / (1 + dtau * fwd_rates[k][t]);
-                }
-                discount_factors[i][t] = accuml;
-            }
-        }
-#ifndef DEBUG_LMM_NUMERAIRE
-        std::cout << "simulated forward_rates";
-        for (int i = 0; i < size; i++) {
-            for (int j = 0; j < size; j++) {
-                std::cout << i << " " << fwd_rates[i][j] ;
-            }
-            std::cout << std::endl;
-        }
-        std::cout << "discount_factors";
-        for (int i = 0; i < size; i++) {
-            for (int j = 0; j < size; j++) {
-                std::cout << i << " " << discount_factors[i][j] ;
-            }
-            std::cout << std::endl;
-        }
-#endif
-    }
-
-    // return forward_rates & discount_factors
-    void numeraire(int index, std::vector<double> &forward_rates, std::vector<double> &discount_factor) {
-        std::fill(forward_rates.begin(), forward_rates.end(), 0.0);
-        std::fill(discount_factor.begin(), discount_factor.end(), 0.0);
-
-        for (int t = 0; t < size - index; t++) {
-            discount_factor[t] = discount_factors[t+index][index];
-            forward_rates[t] = fwd_rates[t+index][index];
-        }
-    }
-
-    inline int getSize() {
-        return size;
-    }
-
-private:
-    std::vector<std::vector<double>> &rho;
-    std::vector<double> &volatility;
-    std::vector<std::vector<double>> fwd_rates;
-    std::vector<std::vector<double>> discount_factors;
-    int size;
-    double dtau;
-    double expiry;
-
-    // Initialize data structures
-    void initialize(std::vector<double> &spot_rates, std::vector<double>& instvol) {
-        // reserve memory
-        fwd_rates = std::vector<std::vector<double>>(size, std::vector<double>(size, 0.0));
-        discount_factors = std::vector<std::vector<double>>(size, std::vector<double>(size, 0.0));
-        // Initialize fwd_rates from the spot rate curve
-        for (int i = 0; i < size; i++) {
-            fwd_rates[i][0] = spot_rates[i];
-        }
-    }
-
-};
-
-
-/*
  * (Musiela Parameterisation HJM) We simulate f(t+dt)=f(t) + dfbar  where SDE dfbar =  m(t)*dt+SUM(Vol_i*phi*SQRT(dt))+dF/dtau*dt  and phi ~ N(0,1)
  */
 class HJMStochasticProcess {
@@ -188,7 +91,8 @@ public:
 
     HeathJarrowMortonModel(std::vector<double> &spot_rates_, std::vector<double> &drifts_, std::vector<std::vector<double>>& volatilities_, int dimension_, double dt_, double dtau_, double expiry_) :
             spot_rates(spot_rates_), drifts(drifts_), volatilities(volatilities_),  dimension(dimension_), dt(dt_), dtau(dtau_), expiry(expiry_),
-            stochasticProcess(spot_rates_, drifts_, volatilities_, dimension_, dt_, dtau_)
+            stochasticProcess(spot_rates_, drifts_, volatilities_, dimension_, dt_, dtau_),
+            forward_rates(spot_rates_.size()), discount_factors(spot_rates_.size())
     {
         size = spot_rates.size();
     }
@@ -222,11 +126,20 @@ public:
                discount_factors[index] = accum_rates[index];
             }
 
+#ifndef DEBUG_HJM_DE
+            std::cout << sim << " ";
+            for (int i = 0; i < fwd_rates.size(); i++) {
+                std::cout << fwd_rates[i] << " ";
+            }
+            std::cout << "   " << gaussian_rand[dimension*sim] << " " << gaussian_rand[dimension*sim+1] << " " << gaussian_rand[dimension*sim+2];
+            std::cout << std::endl;
+#endif
             //swap fwd_rates vectors
             std::copy(fwd_rates.begin(), fwd_rates.end(), fwd_rates0.begin());
         }
 
         // compute discount factors
+        forward_rates[0] = spot_rates[0];
         discount_factors[0] = spot_rates[0];
         std::transform(discount_factors.begin(), discount_factors.end(), discount_factors.begin(), [&](double x) {
             return std::exp(-x * dt);
