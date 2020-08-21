@@ -175,7 +175,7 @@ int main() {
 
     // Random Number Generation
     int random_count = (1.0/dt) * size * simN;
-    std::vector<double> phi_random(random_count, 0.0);
+    double *phi_random = (double *) malloc(random_count * sizeof(double));
     VSLRNGRandomGenerator vsl_gaussian;
     vsl_gaussian(&phi_random[0], random_count);
 
@@ -188,6 +188,9 @@ int main() {
     // Monte Carlo Simulation Engine generate the Exposure IRS Grid
     MonteCarloSimulation<HeathJarrowMortonModel, InterestRateSwap> mc_engine(payOff, heathJarrowMortonModel, phi_random, simN);
     mc_engine.calculate(exposures, duration);
+
+    // free resources
+    free(phi_random);
 
 #ifdef DEBUG_EXPOSURE_CVA
     std::cout << "Exposures Profile" << std::endl;

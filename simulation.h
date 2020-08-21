@@ -11,6 +11,10 @@
 #include "mkl.h"
 #include "mkl_vsl.h"
 
+#ifdef EXPOSURE_GPU_CUDA
+#include "simulation_gpu.h"
+#endif
+
 using namespace std;
 
 /*
@@ -39,20 +43,16 @@ private:
  */
 class HJMStochasticProcess {
 public:
-    HJMStochasticProcess(std::vector<double> &spot_rates_, std::vector<double> &drifts_, std::vector<std::vector<double>>& volatilities_, int dimension_, double dt_, double dtau_) :
-            spot_rates(spot_rates_), drifts(drifts_), volatilities(volatilities_), dimension(dimension_), dt(dt_), dtau(dtau_) {
+    HJMStochasticProcess(std::vector<double> &spot_rates_, std::vector<double> &drifts_, std::vector<std::vector<double>>& volatilities_, int dimension_, double dt_, double dtau_, int size_) :
+            spot_rates(spot_rates_), drifts(drifts_), volatilities(volatilities_), dimension(dimension_), dt(dt_), dtau(dtau_), size(size_) {
     }
 
     inline void evolve(std::vector<double> &fwd_rates, std::vector<double> &fwd_rates0, double *gaussian_rand) {
-        double dfbar = 0.0;
-
-        // tenor size
-        int size = spot_rates.size();
 
         // evolve the sde
         for (int t = 0; t < size; t++) {
             // calculate diffusion term SUM(Vol_i*phi*SQRT(dt))
-            dfbar +=  volatilities[0][t] * gaussian_rand[0];
+            double dfbar =  volatilities[0][t] * gaussian_rand[0];
             dfbar +=  volatilities[1][t] * gaussian_rand[1];
             dfbar +=  volatilities[2][t] * gaussian_rand[2];
             dfbar *= std::sqrt(dt);
@@ -78,6 +78,7 @@ private:
     std::vector<double> &drifts;
     std::vector<double> &spot_rates;
     std::vector<std::vector<double>>& volatilities;
+    int size;
     int dimension;
     double dt;
     double dtau;
@@ -91,10 +92,11 @@ public:
 
     HeathJarrowMortonModel(std::vector<double> &spot_rates_, std::vector<double> &drifts_, std::vector<std::vector<double>>& volatilities_, int dimension_, double dt_, double dtau_, double expiry_) :
             spot_rates(spot_rates_), drifts(drifts_), volatilities(volatilities_),  dimension(dimension_), dt(dt_), dtau(dtau_), expiry(expiry_),
-            stochasticProcess(spot_rates_, drifts_, volatilities_, dimension_, dt_, dtau_),
-            forward_rates(spot_rates_.size()), discount_factors(spot_rates_.size())
+            stochasticProcess(spot_rates_, drifts_, volatilities_, dimension_, dt_, dtau_, expiry_/dtau_ + 1)
     {
-        size = spot_rates.size();
+        size = expiry/dtau + 1;
+        forward_rates = std::vector<double>(size);
+        discount_factors = std::vector<double>(size);
     }
 
     // LMM SDE
@@ -199,7 +201,7 @@ private:
 template<typename InterestRateModel, typename PayOff>
 class MonteCarloSimulation {
 public:
-    MonteCarloSimulation(PayOff &payOff_, InterestRateModel &model_, std::vector<double> &phi_random_, int simN_) :
+    MonteCarloSimulation(PayOff &payOff_, InterestRateModel &model_, double *phi_random_, int simN_) :
             payOff(payOff_), phi_random(phi_random_), model(model_), simN(simN_)
      {
         forward_rates = std::vector<double>(model.getSize());
@@ -210,11 +212,12 @@ public:
      * Monte Carlo Method calculation method engine
      */
     void calculate(std::vector<std::vector<double>> &exposures, double &duration) {
-        auto start = std::chrono::high_resolution_clock::now();
 
+#ifdef EXPOSURE_CPU
+        // calculate exposure profiles using CPU
+        auto start = std::chrono::high_resolution_clock::now();
         // Run simulation to generate Forward Rates Risk Factors Grid using HJM Model and Musiela SDE ( CURAND )
         for (int sim = 1; sim < simN; sim++) {
-
             // Evolve the Forward Rates Risk Factor Simulation Path using Interest Rate Model
             generatePaths(&phi_random[sim * model.randomCount()]);
 
@@ -226,6 +229,10 @@ public:
         auto finish = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = finish - start;
         duration = elapsed.count();
+#else
+        // calculate exposure profiles using CUDA
+        calculateExposureGPU(exposures, payOff, spot_rates, drift, volatilities, simN);
+#endif
     }
 
     /*
@@ -260,7 +267,7 @@ public:
     }
 
 protected:
-    std::vector<double>& phi_random;
+    double *phi_random;
     PayOff &payOff;
     InterestRateModel &model;
     std::vector<double> forward_rates;
