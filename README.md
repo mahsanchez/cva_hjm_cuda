@@ -1,2 +1,2 @@
 # cva_hjm2
-Interest Rate Modelling for Counterparty Credit Risk (GPU-Acceleration)
+Interest Rate Modelling for Counterparty Credit Risk (HJM Model GPU-Acceleration)
