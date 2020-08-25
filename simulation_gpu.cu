@@ -32,7 +32,7 @@ __global__ void initRNG2(curandState* const rngStates, const unsigned int seed)
  * calculate dfbar as dF/dtau*dt
 */
 __device__
-void sde_evolve(double* drifts, double* volatilities, double* fwd_rates, double* fwd_rates0, double dtau, double dt, int size, curandState& state)
+void sde_evolve(double* drifts, double* volatilities, double* fwd_rates, double* fwd_rates0, double dtau, double dt, int size, curandState& state, int base)
 {
     double phi0 = curand_normal_double(&state);
     double phi1 = curand_normal_double(&state);
@@ -51,21 +51,24 @@ void sde_evolve(double* drifts, double* volatilities, double* fwd_rates, double*
         // calculate dF/dtau*dt
         double dF = 0.0;
         if (t < (size - 1)) {
-            dF += fwd_rates0[t + 1] - fwd_rates0[t];
+            dF += fwd_rates0[base + t + 1] - fwd_rates0[base + t];
         }
         else {
-            dF += fwd_rates0[t] - fwd_rates0[t - 1];
+            dF += fwd_rates0[base + t] - fwd_rates0[base + t - 1];
         }
         dfbar += (dF / dtau) * dt;
 
         // apply Euler Maruyana
-        fwd_rates[t] = fwd_rates0[t] + dfbar;
+        fwd_rates[base + t] = fwd_rates0[base + t] + dfbar;
 
-        //debug output
-        printf("%f ", fwd_rates[t]);
+#ifdef DEBUG_HJM_SDE
+        //printf("%f ", fwd_rates[base + t]);
+#endif
     }
 
+#ifdef DEBUG_HJM_SDE
     printf(" %f %f %f\n", phi0, phi1, phi2);
+#endif
 }
 
 /*
@@ -94,16 +97,16 @@ void generatePaths(double* exposures, double* spot_rates, double* drift, double*
     double *fwd_rates, double *fwd_rates0, InterestRateSwap payOff, curandState* rngStates, const int pathN, const int size
 )
 {
-    // Determine thread ID
-    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    //unsigned int step = gridDim.x * blockDim.x;
-
     // Compute Parameters
     __shared__ double accum_rates[TILE_DIM * BLOCK_SIZE];
+    
+    // Determine thread ID
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int local_tid = threadIdx.x * size;
 
     // Simulation Parameters
     double dt = 0.01; // payOff.expiry / pathN;
-    int delta = 100; //  (int)(1.0 / dt);
+    int delta = 100/2; //  (int)(1.0 / dt);
 
     // Initialise the RNG
     curandState localState = rngStates[tid];
@@ -111,27 +114,34 @@ void generatePaths(double* exposures, double* spot_rates, double* drift, double*
     // local memory thread base position
     int base = tid * size;
 
+    // initialize fwd_rates0 with the spot_rates
+    for (int t = 0; t < size; t++) {
+        fwd_rates0[base + t] = spot_rates[t];
+    }
+
     // evolve the hjm model
     for (int sim = 1; sim < pathN; sim++) {
 
+        printf("simulation (%d-%d) %d\n", blockIdx.x, threadIdx.x, sim);
+
         // evolve the hjm sde
-        sde_evolve(drift, volatilities, (fwd_rates + base), (fwd_rates0 + base), payOff.dtau, dt, size, localState);
+        sde_evolve(drift, volatilities, fwd_rates, fwd_rates0, payOff.dtau, dt, size, localState, base);
 
         //accumulate the sum of rates between sim-1 and sim
-        for (int i = base; i < base + size; i++) {
-            accum_rates[i] = accum_rates[i] + fwd_rates[i];
+        for (int i = 0; i < size; i++) {
+            accum_rates[local_tid + i] = accum_rates[local_tid + i] + fwd_rates[base + i];
         }
 
         //register sim whose index constribute to numeraire tenors (potentially coalescing memory access across all threads)
         if (sim % delta == 0) {
-            int index = base + sim / delta;
-            forward_rates[index] = fwd_rates[index];
-            discount_factors[index] = accum_rates[index];
+            int index = sim / delta;
+            forward_rates[base + index] = fwd_rates[base + index];
+            discount_factors[base + index] = accum_rates[local_tid + index];
         }
 
         //swap fwd_rates vectors
-        for (int i = base; i < base + size; i++) {
-            fwd_rates0[i] = fwd_rates[i];
+        for (int i = 0; i < size; i++) {
+            fwd_rates0[base + i] = fwd_rates[base + i];
         }
     }
 
@@ -140,24 +150,26 @@ void generatePaths(double* exposures, double* spot_rates, double* drift, double*
     discount_factors[base] = spot_rates[0];
 
     // (potentially coalescing memory access across all threads)
-    for (int i = base; i < base + size; i++) {
-        discount_factors[i] = exp(-discount_factors[i] * dt);
+    for (int i = 0; i <  size; i++) {
+        discount_factors[base + i] = exp(-discount_factors[base + i] * dt);
     }
 
-    // Wait till all threads in the block has finished to exploit coalescing memory access on forward_rates and discount_factors global memory arrays
-     __syncthreads(); 
+#ifndef DEBUG_HJM_SDE
+    for (int i = 0; i < size; i++) {
+        printf(" %f ", discount_factors[base + i]);
+    }  
+    printf("\n");
+    for (int i = 0; i < size; i++) {
+        printf(" %f ", forward_rates[base + i]);
+    }
+    printf("\n");
+#endif
+  
 
     // perform mark to market and compute exposure (potentially coalescing memory access across all threads)
     pricePayOff(&exposures[tid * size], payOff, &forward_rates[base], &discount_factors[base], payOff.expiry); 
 }
 
-
-// Constant Memory
-/*
-__constant__ double* d_spot_rates = 0;
-__constant__ double* d_drifts = 0;
-__constant__ double* d_volatilities = 0;
-*/
 
 /*
    Exposure Calculation Kernel Invocation
@@ -165,8 +177,8 @@ __constant__ double* d_volatilities = 0;
 void calculateExposureGPU(double* exposures, InterestRateSwap payOff, double* spot_rates, double* drift, double* volatilities, int simN, int size) {
 
     // kernel execution configuration Determine how to divide the work between cores
-    int blockSize =  32;
-    dim3 block = blockSize;
+    int blockSize = 32;
+    dim3 block = blockSize; // blockSize;
     dim3 grid = (simN + blockSize - 1) / blockSize;
 
     // seed
@@ -212,7 +224,7 @@ void calculateExposureGPU(double* exposures, InterestRateSwap payOff, double* sp
 
    
     // HJM Model number of paths
-    int pathN = 2000;
+    int pathN = 2500;
     
     // Initialise RNG
     initRNG2<<< grid, block >>>(d_rngStates, m_seed);
