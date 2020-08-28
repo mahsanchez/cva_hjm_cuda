@@ -91,9 +91,9 @@ void generatePaths(double* forward_rates, double *discount_factors, double* spot
             phi2 = curand_normal_double(&localState);
         }
 // Broadcast random values across the whole warp
-        __shfl_sync(0xffffffff, phi0, 0);
-        __shfl_sync(0xffffffff, phi1, 0);
-        __shfl_sync(0xffffffff, phi2, 0);
+        phi0 = __shfl_sync(0xffffffff, phi0, 0);
+        phi1 = __shfl_sync(0xffffffff, phi1, 0);
+        phi2 = __shfl_sync(0xffffffff, phi2, 0);
 
 #ifdef HJM_SDE_DEBUG
         if (laneid != 0) {
@@ -175,7 +175,7 @@ void calculateExposureGPU(double* exposures, InterestRateSwap payOff, double* sp
     // kernel execution configuration Determine how to divide the work between cores
     int blockSize = 32;
     dim3 block = blockSize; // blockSize;
-    dim3 grid = (simN + blockSize - 1) / blockSize;
+    dim3 grid = 1; // (simN + blockSize - 1) / blockSize;
 
     // seed
     double m_seed = 1234;
