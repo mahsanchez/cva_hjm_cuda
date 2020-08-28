@@ -71,7 +71,7 @@ void testSimulationGPU() {
     
     InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.025, expiry, dtau);
 
-    calculateExposureGPU(exposures, payOff,  &spot_rates[0], &drifts[0], &volatilities[0], simN, 51);
+    calculateExposureGPU(exposures, payOff,  &spot_rates[0], &drifts[0], &volatilities[0], simN);
 
     free(exposures);
 }
