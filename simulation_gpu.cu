@@ -1,6 +1,5 @@
 
 #include <cuda_runtime.h>
-#include <curand.h>
 #include <curand_kernel.h>
 #include <helper_functions.h>
 #include <helper_cuda.h>
@@ -13,7 +12,28 @@
 #define BLOCK_SIZE 32
 
 #define HJM_SDE_DEBUG
+#define MC_RDM_DEBUG1
+#define HJM_FORWARD_RATES
+#define HJM_DISCOUNT_FACTORS
+#define EXPOSURE_PROFILES_DEBUG
 
+/*
+ * Mark to Market Exposure profile calculation for Interest Rate Swap (marktomarket) pricePayOff()
+*/
+__device__
+void pricePayOff(float* exposure, float notional,  float dtau, float K, float* forward_rates, float* discount_factors, float expiry) {
+
+    int size = (int) (expiry /dtau + 1);
+
+    for (int i = 1; i < size - 1; i++) {
+        float price = 0;
+        for (int t = i; t < size; t++) {
+            float sum = discount_factors[t] * notional * dtau * (forward_rates[t] - K);
+            price += sum;
+        }
+        exposure[i] = price > 0 ? price : 0.0;
+    }
+}
 
 
 // RNG init kernel
@@ -23,40 +43,24 @@ __global__ void initRNG2(curandState* const rngStates, const unsigned int seed)
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Initialise the RNG
-    curand_init(seed, tid, 0, &rngStates[tid]);
+    curand_init(seed, tid, 6000, &rngStates[tid]);
 }
 
 
-/*
- * Mark to Market Exposure profile calculation for Interest Rate Swap (marktomarket) pricePayOff()
-*/
-void pricePayOff(double* exposure, InterestRateSwap payOff, double* forward_rates, double* discount_factors, double expiry) {
-
-    int size = (int) payOff.expiry / payOff.dtau + 1;
-
-    for (int i = 1; i < size - 1; i++) {
-        double price = 0;
-        for (int t = i; t < size; t++) {
-            double sum = discount_factors[t] * payOff.notional * payOff.dtau * (forward_rates[t] - payOff.K);
-            price += sum;
-        }
-        exposure[i] = fmax(price, 0.0);
-    }
-}
 
 /*
  * Path generation kernel 
  */
 __global__
-void generatePaths(double* forward_rates, double *discount_factors, double* spot_rates, double* drifts, double* volatilities, double dtau, curandState* rngStates, const int pathN)
+void generatePaths(float* exposure, float* forward_rates, float *discount_factors, float* spot_rates, float* drifts, float* volatilities, float dtau, curandState* rngStates, const int pathN)
 {
 // Compute Parameters
-    double phi0;
-    double phi1;
-    double phi2;
-    double rate;
-    double accum_rates[2];
-    __shared__ double rates0[TIMEPOINTS];
+    float phi0;
+    float phi1;
+    float phi2;
+    float rate;
+    float accum_rates[2];
+    __shared__ float rates0[TIMEPOINTS];
     
     
  // Determine thread ID
@@ -65,12 +69,12 @@ void generatePaths(double* forward_rates, double *discount_factors, double* spot
     unsigned int laneid = threadIdx.x % 32;
 
  // Simulation Parameters
-    double dt = 0.01; // 
+    float dt = 0.01; // 
     int delta = 100; //  
-    const double sqrt_dt = sqrt(dt);
+    const float sqrt_dt = sqrt(dt);
 
 // Initialise the RNG
-    curandState localState = rngStates[bid];
+    curandState  localState = rngStates[bid];
 
 // Initialize rates0
     for (int block = 0; block < TIMEPOINTS; block += BLOCK_SIZE)
@@ -86,16 +90,16 @@ void generatePaths(double* forward_rates, double *discount_factors, double* spot
     for (int sim = 0; sim < pathN; sim++) 
     {
         if (laneid == 0) {
-            phi0 = curand_normal_double(&localState);
-            phi1 = curand_normal_double(&localState);
-            phi2 = curand_normal_double(&localState);
+            phi0 = curand_normal(&localState);
+            phi1 = curand_normal(&localState);
+            phi2 = curand_normal(&localState);
         }
 // Broadcast random values across the whole warp
         phi0 = __shfl_sync(0xffffffff, phi0, 0);
         phi1 = __shfl_sync(0xffffffff, phi1, 0);
         phi2 = __shfl_sync(0xffffffff, phi2, 0);
 
-#ifdef HJM_SDE_DEBUG
+#ifdef MC_RDM_DEBUG
         if (laneid != 0) {
             printf("Thread %d Normal variates %f %f %f.\n", threadIdx.x, phi0, phi1, phi2);
         }
@@ -111,14 +115,14 @@ void generatePaths(double* forward_rates, double *discount_factors, double* spot
             {
                 // We simulate the SDE f(t+dt)=f(t) + dfbar  
                 // where SDE dfbar =  m(t)*dt+SUM(Vol_i*phi*SQRT(dt))+dF/dtau*dt and phi ~ N(0,1)
-                double dfbar = volatilities[t] * phi0;
+                float dfbar = volatilities[t] * phi0;
                 dfbar += volatilities[TIMEPOINTS + t] * phi1;
                 dfbar += volatilities[TIMEPOINTS * 2 + t] * phi2;
                 dfbar *= sqrt_dt;
                 // drift
                 dfbar += drifts[t] * dt;
                 // calculate dF/dtau*dt
-                double dF = 0.0;
+                float dF = 0.0;
 
                 if (t < (TIMEPOINTS - 1)) {
                     dF = rates0[t + 1] - rates0[t];
@@ -140,92 +144,113 @@ void generatePaths(double* forward_rates, double *discount_factors, double* spot
              if (t < TIMEPOINTS) 
              {
                 int i = (t < BLOCK_SIZE) ?  0 : 1;
-                accum_rates[i] = accum_rates[i] + rate;
+                accum_rates[i] += rate;
 
                 if (sim % delta == 0) {
                     int index = sim / delta;
                     if (t == index) {
-                       forward_rates[t] = rate;
-                       double r = (t < BLOCK_SIZE) ? accum_rates[0] : accum_rates[1];
-                       discount_factors[t] = exp(-r * dt);
-                    }
-                    
+                       forward_rates[blockIdx.x * TIMEPOINTS + t] = rate;
+                       float r = (t < BLOCK_SIZE) ? accum_rates[0] : accum_rates[1];
+                       discount_factors[blockIdx.x * TIMEPOINTS + t] = exp(-r * dt);
+                    }       
                 }
-            }
-             __syncthreads();
-            
+            }   
         }
-
     }
 
-    // Initialize numeraire at timepoint 0
-    if (tid == 0) {
-        double r = rates0[0];
-        forward_rates[0] = r;
-        discount_factors[0] = exp(-r * dt);
-    }
 }
 
 
 /*
    Exposure Calculation Kernel Invocation
+   TODO - BATCHING
 */
-void calculateExposureGPU(double* exposures, InterestRateSwap payOff, double* spot_rates, double* drift, double* volatilities, int simN) {
+void calculateExposureGPU(float* exposures, InterestRateSwap payOff, float* spot_rates, float* drift, float* volatilities, int simN) {
 
+    int _simN = 100;
     // kernel execution configuration Determine how to divide the work between cores
     int blockSize = 32;
     dim3 block = blockSize; // blockSize;
-    dim3 grid = 1; // (simN + blockSize - 1) / blockSize;
+    dim3 grid = _simN; // 64 _simN;
 
     // seed
-    double m_seed = 1234;
+    float m_seed = 1234;
 
     // Memory allocation 
     curandState* d_rngStates = 0;
-    double* d_spot_rates = 0;
-    double* d_drifts = 0;
-    double* d_volatilities = 0;
-    double* d_forward_rates = 0;
-    double* d_discount_factors = 0;
+    float* d_spot_rates = 0;
+    float* d_drifts = 0;
+    float* d_volatilities = 0;
+    float* d_forward_rates = 0;
+    float* d_discount_factors = 0;
+    float* d_exposures = 0;
 
     // CPU Host variables
-    double* forward_rates = 0;
-    double* discount_factors = 0;
+    float* forward_rates = 0;
+    float* discount_factors = 0;
 
-    
+    //
+    forward_rates = (float*)malloc(grid.x * TIMEPOINTS * sizeof(float));
+    discount_factors = (float*)malloc(grid.x * TIMEPOINTS * sizeof(float));
+
     // Copy the spot_rates, drift & volatilities to device memory
-    checkCudaErrors(cudaMalloc((void**)&d_spot_rates, TIMEPOINTS * sizeof(double)));
-    checkCudaErrors(cudaMalloc((void**)&d_drifts, TIMEPOINTS * sizeof(double)));
-    checkCudaErrors(cudaMalloc((void**)&d_volatilities, VOL_DIM * TIMEPOINTS * sizeof(double)));
+    checkCudaErrors(cudaMalloc((void**)&d_spot_rates, TIMEPOINTS * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&d_drifts, TIMEPOINTS * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&d_volatilities, VOL_DIM * TIMEPOINTS * sizeof(float)));
 
     // spot_rates, drifts, volatilities, forward_rates, discount_factors
     checkCudaErrors(cudaMalloc((void**)&d_rngStates, grid.x * block.x * sizeof(curandState)));
-    checkCudaErrors(cudaMalloc((void**)&d_forward_rates, grid.x * TIMEPOINTS * sizeof(double)));
-    checkCudaErrors(cudaMalloc((void**)&d_discount_factors, grid.x * TIMEPOINTS * sizeof(double)));
+    checkCudaErrors(cudaMalloc((void**)&d_forward_rates, grid.x * TIMEPOINTS * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&d_discount_factors, grid.x * TIMEPOINTS * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&d_exposures, grid.x * TIMEPOINTS * sizeof(float)));
 
     // Copy the spot_rates, drift & volatilities to device global memory
-    checkCudaErrors(cudaMemcpy(d_spot_rates, spot_rates, TIMEPOINTS * sizeof(double), cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_drifts, drift, TIMEPOINTS * sizeof(double), cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_volatilities, volatilities, VOL_DIM * TIMEPOINTS * sizeof(double), cudaMemcpyHostToDevice));
-   
+    checkCudaErrors(cudaMemcpy(d_spot_rates, spot_rates, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_drifts, drift, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_volatilities, volatilities, VOL_DIM * TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
+
     // HJM Model number of paths
-    int pathN = 2500;
-    
+    int pathN = 3800;
+
     // Initialise RNG
-    initRNG2<<< grid, block >>>(d_rngStates, m_seed);
+    initRNG2 << < grid, block >> > (d_rngStates, m_seed);
 
     // Generate Paths and Compute IRS Mark to Market
-    generatePaths <<<grid, block >>> (d_forward_rates, d_discount_factors, d_spot_rates, d_drifts, d_volatilities, payOff.dtau, d_rngStates, pathN);
-    
+    generatePaths << <grid, block >> > (d_exposures, d_forward_rates, d_discount_factors, d_spot_rates, d_drifts, d_volatilities, payOff.dtau, d_rngStates, pathN);
+
     // Wait for all kernel to finish
     cudaDeviceSynchronize();
 
-    // Copy partial results back
-    checkCudaErrors( cudaMemcpy(forward_rates, d_forward_rates, TIMEPOINTS * sizeof(double), cudaMemcpyDeviceToHost) );
-    checkCudaErrors( cudaMemcpy(discount_factors, d_discount_factors, TIMEPOINTS * sizeof(double), cudaMemcpyDeviceToHost));
+    // Done with MC Simulation 
+#ifdef HJM_SDE_DEBUG
+    printf("MC Simulation generated");
+#endif
 
-    // Price Interest Rate Swap
-    pricePayOff(exposures, payOff, forward_rates, discount_factors, payOff.expiry);
+    // Copy partial results back
+    checkCudaErrors(cudaMemcpy(forward_rates, d_forward_rates, grid.x * TIMEPOINTS * sizeof(float), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(discount_factors, d_discount_factors, grid.x * TIMEPOINTS * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Interest Rate Swap Mark to Market
+    // pricePayOff(float* exposure, float notional,  float dtau, float K, float* forward_rates, float* discount_factors, float expiry) 
+
+#ifdef HJM_DISCOUNT_FACTORS
+    for (int i = 0; i < _simN; i++) {
+        printf("Discount Factors: %d\n", i);
+        for (int t = 0; t < TIMEPOINTS; t++) {
+            printf("%d : %f ", t, discount_factors[i * TIMEPOINTS + t]);
+        }
+        printf("\n");
+    }
+#endif
+#ifdef HJM_FORWARD_RATES
+    for (int i = 0; i < _simN; i++) {
+        printf("Forward Rate Curve: %d\n", i);
+        for (int t = 0; t < TIMEPOINTS; t++) {
+            printf("%d : %f ", t, forward_rates[i * TIMEPOINTS + t]);
+        }
+        printf("\n");
+    }
+#endif
 
     // Free Reserved Memory
     if (d_rngStates) {
@@ -244,12 +269,24 @@ void calculateExposureGPU(double* exposures, InterestRateSwap payOff, double* sp
         cudaFree(d_volatilities);
     }
 
+    if (d_exposures) {
+        cudaFree(d_discount_factors);
+    }
+
     if (d_forward_rates) {
         cudaFree(d_forward_rates);
     }
 
     if (d_discount_factors) {
         cudaFree(d_discount_factors);
+    }
+
+    if (forward_rates) {
+        free(forward_rates);
+    }
+
+    if (discount_factors) {
+        free(discount_factors);
     }
 }
 
