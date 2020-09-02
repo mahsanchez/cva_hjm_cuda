@@ -17,6 +17,14 @@ std::vector<float> spot_rates = {
         0.039802053,0.039721437,0.03964844
 };
 
+
+//Year Count Fractiions 30/360
+std::vector<float> yearCountFractions = {
+        0.25000, 0.25278, 0.25556, 0.25556, 0.25000, 0.25278, 0.25556, 0.25556, 0.25000, 0.25278, 0.25556, 0.25556, 0.25278, 0.25278, 0.26111, 0.25278, 0.25278, 0.25278, 0.25278, 0.25278,
+        0.25278, 0.25278, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25556,
+        0.25556, 0.25556, 0.26111, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25556, 0.25556
+};
+
 // Volatility Calibration
 /*
  * HJM Calibration (volatilities, drift)
@@ -72,7 +80,7 @@ void testSimulationGPU() {
     
     InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.025, expiry, dtau);
 
-    calculateExposureGPU(exposures, payOff,  &spot_rates[0], &drifts[0], &volatilities[0], _simN);
+    calculateExposureGPU(exposures, payOff, &yearCountFractions[0], &spot_rates[0], &drifts[0], &volatilities[0], _simN);
 
     free(exposures);
 }
