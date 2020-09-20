@@ -20,9 +20,20 @@ std::vector<float> spot_rates = {
 
 //Year Count Fractiions 30/360
 std::vector<float> yearCountFractions = {
-        0.25000, 0.25278, 0.25556, 0.25556, 0.25000, 0.25278, 0.25556, 0.25556, 0.25000, 0.25278, 0.25556, 0.25556, 0.25278, 0.25278, 0.26111, 0.25278, 0.25278, 0.25278, 0.25278, 0.25278,
-        0.25278, 0.25278, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25556,
-        0.25556, 0.25556, 0.26111, 0.25278, 0.25556, 0.25556, 0.25556, 0.26111, 0.25278, 0.25556, 0.25556
+    0.04000, 0.00250, 0.25278,  0.2500642, 0.25556,  0.2513385, 0.25556,  0.25000,  0.25278,  0.25556,  0.25556,
+    0.25556, 0.25556,  0.25278,  0.25278, 0.26111, 0.25278,  0.25278,  0.25278, 0.25278, 0.25278,
+    0.25556, 0.25556,  0.25278,  0.25278, 0.26111, 0.25278,  0.25278,  0.25278, 0.25278, 0.25278, 
+    0.25278, 0.25278 , 0.25278  , 0.25556, 0.25556, 0.25694, 0.25556, 0.25278, 0.25278, 0.25556,
+    0.25556, 0.25556,  0.25278,  0.25278, 0.26111, 0.25278,  0.25278,  0.25278, 0.25278, 0.25278
+};
+
+//Year Count Fractiions 30/360
+std::vector<float> accrual = {
+    0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556, 0.505556,
+    0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556,
+    0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556,
+    0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556,
+    0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556,
 };
 
 // Volatility Calibration
@@ -71,21 +82,19 @@ std::vector<float> fixed_schedule = {
 };
 
 
-void testSimulationGPU() {
+void testSimulationGPU(int simN) {
 
-    int simN = 6000;
-    int _simN = 64;
-
-    float* exposures = (float*) malloc(51 * _simN * sizeof(float));
+    float* exposure_curve = (float*) malloc(51 * sizeof(float));
     
     InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.025, expiry, dtau);
 
-    calculateExposureGPU(exposures, payOff, &yearCountFractions[0], &spot_rates[0], &drifts[0], &volatilities[0], _simN);
+    calculateExposureGPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], simN);
 
-    free(exposures);
+    free(exposure_curve);
 }
 
+// TODO - Pass the number of exposure simulations 
 int main(int argc, char** argv)
 {
-    testSimulationGPU();
+    testSimulationGPU(6000);
 }
