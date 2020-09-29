@@ -96,5 +96,5 @@ void testSimulationGPU(int simN) {
 // TODO - Pass the number of exposure simulations 
 int main(int argc, char** argv)
 {
-    testSimulationGPU(6000);
+    testSimulationGPU(10);
 }
