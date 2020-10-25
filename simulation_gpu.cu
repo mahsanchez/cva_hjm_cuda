@@ -20,6 +20,7 @@
 #define TIMEPOINTS 51
 #define VOL_DIM 3
 #define BLOCKSIZE 32
+#define WARPSIZE 32
 #define MAX_BLOCK_SZ 256
 #define BATCH_SZ 1000
 
@@ -69,7 +70,7 @@ float musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0, f
 * * RNG init Kernel
 */
 
-__global__ void initRNG2(curandStateMRG32k3a* const rngStates, const unsigned int seed, int rnd_count)
+__global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsigned int seed, int rnd_count)
 {
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -79,14 +80,15 @@ __global__ void initRNG2(curandStateMRG32k3a* const rngStates, const unsigned in
    
 }
 
+
+
 /*
  * Path generation kernel 
  * one to one mapping between threadIdx.x and tenor 
  */
 __global__
-void generatePaths(float* exposure, int timepoints, const float notional, const float K, float* accrual, float* spot_rates, float* drifts, float* volatilities, float dtau, curandStateMRG32k3a* const rngStates, const int pathN)
+void generatePaths_kernel(float2* numeraires, int timepoints, float* spot_rates, float* drifts, float* volatilities, float dtau, curandStateMRG32k3a* const rngStates, const int pathN)
 {
-    //
     __shared__ float simulated_rates[TIMEPOINTS];
     // Compute Parameters
     __shared__ float phi0;
@@ -99,9 +101,15 @@ void generatePaths(float* exposure, int timepoints, const float notional, const 
     const float sqrt_dt = sqrt(dt);
     int sim_blck_count = pathN / stride;
     int t = threadIdx.x;
+    // Simulation Results
     float forward_rate;
     float discount_factor;
     float accum_rates;
+    float forward_rate1;
+    float discount_factor1;
+    float accum_rates1;
+
+    int globaltid = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Initialize simulated_rates with the spot_rate values
     if (threadIdx.x < timepoints) {
@@ -125,6 +133,7 @@ void generatePaths(float* exposure, int timepoints, const float notional, const 
                 phi2 = curand_normal( &rngStates[blockIdx.x * 3 + 2]);
             }
 
+            // TODO broadcast random values shfl_sync across the whole Warp
             // synchronize threads block for next simulation step
             __syncthreads();
            
@@ -161,7 +170,7 @@ void generatePaths(float* exposure, int timepoints, const float notional, const 
                 accum_rates += rate;
             }
 
-            // Block all threads in the block waiting for rate calculation
+            // Block all threads in the block till the whole forward rate have evolved across all tenors
             __syncthreads();
 
             // Upate the Forware Rate Curve at timepoint t for the next simulation
@@ -186,34 +195,57 @@ void generatePaths(float* exposure, int timepoints, const float notional, const 
 
     }
 
-    // once all simulation finished each thread calculate a cashflows at timepoint equals to threadIdx.x
-    if (threadIdx.x < timepoints)
-    {
-        // calculate cash_flows                       
-        float cash_flow = discount_factor * notional * accrual[threadIdx.x] * (forward_rate - K);
-        simulated_rates[threadIdx.x] = cash_flow;
-
-#ifdef MC_RDM_DEBUG1
-        printf("Block %d Thread %d CashFlow %f DiscountFactor %f ForwardRate %f. YearCtFra %f\n", blockIdx.x, threadIdx.x, cash_flow, discount_factor, forward_rate, accrual[threadIdx.x]);
-#endif
+    // write back in numeraire global memory the forward_rate and discount_factor value
+    if ( threadIdx.x < TIMEPOINTS ) {
+        numeraires[globaltid].x = forward_rate;
+        numeraires[globaltid].y = discount_factor;
     }
-    __syncthreads();
+}
 
 
-    // calculate the exposure profile
-    if (threadIdx.x < timepoints)
+
+/*
+ * Exposure generation kernel
+ * one to one mapping between threadIdx.x and tenor
+ */
+__global__
+void gpuReduceExposure_kernel(float* exposure, float2* numeraires, const float notional, const float K, float* accrual, int simN)
+{
+    __shared__ float cash_flows[TIMEPOINTS];
+    float discount_factor;
+    float forward_rate;
+    float sum = 0.0;
+
+    int globaltid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (; globaltid < simN * TIMEPOINTS; globaltid += blockDim.x * TIMEPOINTS)
     {
-        float sum = 0.0;
-        for (int t = threadIdx.x + 1; t < TIMEPOINTS; t++) {
-            sum += simulated_rates[t];
+    // calculate and load the cash flow in shared memory
+        if (threadIdx.x < TIMEPOINTS) {
+            forward_rate = numeraires[globaltid].x;
+            discount_factor = numeraires[globaltid].y;          
+            cash_flows[threadIdx.x] = discount_factor * notional * accrual[threadIdx.x] * (forward_rate - K);
         }
-        sum = (sum > 0.0) ? sum : 0.0;
-        exposure[(blockIdx.x * timepoints) + threadIdx.x] = sum;
-#ifdef MC_RDM_DEBUG1
-        printf("Block %d Thread %d Exposure %f \n", blockIdx.x, threadIdx.x, sum);
-#endif
-    }
+        __syncthreads();
 
+        // calculate the exposure profile
+        if ( threadIdx.x <= (TIMEPOINTS - 1) )
+        {
+            #pragma unroll
+            for (int t = threadIdx.x + 1; t < TIMEPOINTS; t++) {
+                sum += cash_flows[t];
+            }
+
+            sum = (sum > 0.0) ? sum : 0.0;
+        
+            exposure[globaltid] = sum;
+
+    #ifdef MC_RDM_DEBUG1
+            printf("Block %d Thread %d Exposure %f \n", blockIdx.x, threadIdx.x, sum);
+    #endif
+        }
+        __syncthreads();
+    }   
 }
 
 
@@ -235,8 +267,9 @@ void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
     for (int i = 0; i < simN; i++) {
         identitiy_vector[i] = 1.0;
     }
+
+    // TODO - Move the d_x identity vector to Constant Memory
     checkCudaErrors( cudaMemcpy(d_x, identitiy_vector, simN * sizeof(float), cudaMemcpyHostToDevice) );
-    //checkCudaErrors(cudaMemcpy(d_y, identitiy_vector, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
 
     // Matrix Vector Multiplication to Reduce a Matrix by columns
     cublasHandle_t handle;
@@ -246,7 +279,7 @@ void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
     float cols = (float)TIMEPOINTS;
     float rows = (float)simN;
     
-    // Applay matrix x identity vector (all 1) to do a column reduction by rows
+    // Apply matrix x identity vector (all 1) to do a column reduction by rows
     cublasSgemv(handle, CUBLAS_OP_N, cols, rows,  &alpha, exposures, cols, d_x, 1, &beta, d_y, 1);
     cudaDeviceSynchronize();
 
@@ -288,9 +321,9 @@ void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
 /*
    Exposure Calculation Kernel Invocation
 */
-void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int simN) {
+void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int _simN) {
 
-    int _simN = 32000; // 1000; // 1000; // 1000; // 256; // 100; 1024
+    //int _simN = 32000; // 1000; // 1000; // 1000; // 256; // 100; 1024
     unsigned int curve_points_size_bytes = TIMEPOINTS * sizeof(float);
     unsigned int total_curve_points_size_bytes = _simN * curve_points_size_bytes;
 
@@ -304,6 +337,7 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     float* d_drifts = 0;
     float* d_volatilities = 0;
 #endif
+    float2* d_numeraire = 0;
     float* d_exposures = 0;
     curandStateMRG32k3a* rngStates = 0;
 
@@ -321,6 +355,9 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
 
     // Rng buffer
     checkCudaErrors(cudaMalloc((void**)&rngStates, VOL_DIM * _simN * sizeof(curandStateMRG32k3a)));
+
+    // Numeraire (discount_factor, forward_rates)
+    checkCudaErrors(cudaMalloc((void**)&d_numeraire, _simN * TIMEPOINTS * sizeof(float2)));
 
     // Exposure profiles
     checkCudaErrors(cudaMalloc((void**)&d_exposures, _simN * TIMEPOINTS * sizeof(float)));
@@ -352,7 +389,7 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     int minGridSize;
     int gridSize;
     int rngCount = VOL_DIM * _simN;
-    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, initRNG2, 0, rngCount);
+    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, initRNG2_kernel, 0, rngCount);
 
     // Round up according to array size
     gridSize = (rngCount + blockSize - 1) / blockSize;
@@ -362,7 +399,7 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    initRNG2 << <gridSize, blockSize >> > (rngStates, 1234ULL, rngCount);
+    initRNG2_kernel <<<gridSize, blockSize >>> (rngStates, 1234ULL, rngCount);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -375,30 +412,28 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     numBlocksPerSm = 0;
     blockSize = 64;
     cudaGetDeviceProperties(&deviceProp, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, generatePaths, blockSize, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, generatePaths_kernel, blockSize, 0);
     gridSize = deviceProp.multiProcessorCount * numBlocksPerSm;
 
     printf("Max Occupancy on number of blocks %d \n", numBlocksPerSm);
     printf("Max number of exposures profiles %d and simulations  %d \n", _simN, _simN * pathN);
     printf("gridSize %d and blockSize %d \n", gridSize, blockSize);
 
-    // launch
+    // kernel execution configuration launch
     dim3 dimBlock(blockSize, 1, 1);
     dim3 dimGrid(gridSize, 1, 1);
 
     float totalMilliseconds = 0;
 
+    // Accelerate MC Simulation - TODO launch kernels with streams
     for (int i = 0; i < _simN; i += gridSize) {
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
         cudaEventRecord(start);
 
-        generatePaths << < dimGrid, dimBlock >> > (
-            &d_exposures[i],
+        generatePaths_kernel <<< dimGrid, dimBlock >>> (
+            &d_numeraire[i],
             TIMEPOINTS,
-            payOff.notional,
-            payOff.K,
-            d_accrual,
             d_spot_rates,
             d_drifts,
             d_volatilities,
@@ -415,89 +450,51 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
         printf("MC Simulation Execution Time %fms\n", milliseconds);
     }
 
-
     printf("MC Simulation Total Execution Time %fms\n", totalMilliseconds);
-    
-    // streams creation
-    //int num_streams = _simN/BATCH_SZ;
-    //cudaStream_t *streams = (cudaStream_t *) malloc(num_streams * sizeof(cudaStream_t));
 
-    //for (int i = 0; i < num_streams; i++) {
-    //    cudaStreamCreate(&streams[i]);
-    //}
+    // Exposure Calculation 
 
-    // Set the CUDA execution kernel configuration
-    //dim3 block = BLOCKSIZE;
-    //dim3 grid = (BATCH_SZ * TIMEPOINTS + BLOCKSIZE - 1) / BLOCKSIZE; // 
-    
-    //
-    // Run the simulation
-    /*
-    for (int s = 0; s < num_streams; s++) {
-            generatePaths << < grid, block, 0, streams[s] >> > (
-                d_exposures + s * TIMEPOINTS * 1000,
-                1000,
-                payOff.notional,
-                payOff.K,
-                d_accrual,
-                d_spot_rates,
-                d_drifts, d_volatilities,
-                payOff.dtau,
-                d_rngNrmVar + s * BATCH_SZ * 2500,
-                pathN
-            );
-    }
+    /// This will launch a grid that can maximally fill the GPU, on the default stream with kernel arguments
+    numBlocksPerSm = 0;
+    blockSize = 64;
+    cudaGetDeviceProperties(&deviceProp, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, gpuReduceExposure_kernel, blockSize, 0);
+    gridSize = deviceProp.multiProcessorCount * numBlocksPerSm;
 
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
 
-    // Wait for all Streams to finish
-    for (int s = 0; s < num_streams; s++) {
-        cudaStreamSynchronize(streams[s]);
-    }
-    */
+    gpuReduceExposure_kernel <<<dimGrid, dimBlock>>>(d_exposures, d_numeraire, payOff.notional, payOff.K, d_accrual, _simN);
 
-    // Use a second Kernel to Average Across TimePoints and produce the Expected Exposure Profile
-#ifdef EXPOSURE_PROFILES_DEBUG1
-    float* h_exposures = (float*)malloc(total_curve_points_size_bytes);
-    checkCudaErrors(cudaMemcpy(h_exposures, d_exposures, total_curve_points_size_bytes, cudaMemcpyDeviceToHost));
-
-    for (int i = 0; i < _simN; i++) {
-        for (int t = 0; t < TIMEPOINTS; t++) {
-            printf("%1.4f ", h_exposures[i* TIMEPOINTS + t]);
-        }
-        printf("\n");
-    }   
-
-    free(h_exposures);
-
-    goto release_resources;
-#endif
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    totalMilliseconds += milliseconds;
+    printf("Exposure Calculation  Time %fms\n", milliseconds);
 
     // Average across all the exposures profiles to obtain the Expected Exposure Profile
 
     // Done with MC Simulation 
 #ifdef HJM_SDE_DEBUG12
-    printf("MC Simulation generated");
+    printf("MC Simulation completed");
     goto release_resources;
 #endif
 
-    // Reduce all exposures realizations and average them to obtain the Expected Exposures 
-    // calculateExpectedExposure(float* expected_exposure, float* exposure, int simN)
-    //gpuSumReduceAvg(expected_exposure, d_exposures, _simN);
+    // Expected Exposure Profile Calculation
+    // Reduce all exposures realizations and average them to obtain the Expected Exposures (2D reduction on expsure matrix)
+    gpuSumReduceAvg(expected_exposure, d_exposures, _simN);
 
 #ifdef HJM_SDE_DEBUG1
     printf("Expected Exposure Calculated");
 #endif
 
 release_resources:
-    // Destroy the Host API randome generator
-    //checkCudaErrors(curandDestroyGenerator(randomGenerator));
 
-    // destroy all created streams
-    //for (int i = 0; i < num_streams; i++) {
-    //    cudaStreamCreate(&streams[i]);
-    //}
-
-    // Free Reserved Memory  d_rngNrmVar
+    if (d_numeraire) {
+        cudaFree(d_numeraire);
+    }
   
     if (rngStates) {
         cudaFree(rngStates);

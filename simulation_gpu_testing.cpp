@@ -96,5 +96,9 @@ void testSimulationGPU(int simN) {
 // TODO - Pass the number of exposure simulations 
 int main(int argc, char** argv)
 {
-    testSimulationGPU(10);
+    int simN = atoi(argv[1]);
+
+    printf("Number of Simulations %d", simN);
+
+    testSimulationGPU(simN);
 }
