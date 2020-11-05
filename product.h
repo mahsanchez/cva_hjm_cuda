@@ -1,4 +1,5 @@
-
+#ifndef INTEREST_RATE_SWAP
+#define INTEREST_RATE_SWAP
 
 struct InterestRateSwap {
     InterestRateSwap(float* pricing_points_, float* floating_schedule_, float* fixed_schedule_, float notional_, float K_, float expiry_, float dtau_) :
@@ -13,3 +14,5 @@ struct InterestRateSwap {
     float dtau;
     float expiry;
 };
+
+#endif

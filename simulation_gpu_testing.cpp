@@ -3,6 +3,7 @@
 #include <iterator>
 #include <algorithm>
 
+#include "simulation_cpu.h"
 #include "simulation_gpu.h"
 
 /*
@@ -82,6 +83,18 @@ std::vector<float> fixed_schedule = {
 };
 
 
+void testSimulationCPU(int simN) {
+
+    float* exposure_curve = (float*)malloc(51 * sizeof(float));
+
+    InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.025, expiry, dtau);
+
+    calculateExposureCPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], simN);
+
+    free(exposure_curve);
+}
+
+
 void testSimulationGPU(int simN) {
 
     float* exposure_curve = (float*) malloc(51 * sizeof(float));
@@ -98,7 +111,9 @@ int main(int argc, char** argv)
 {
     int simN = atoi(argv[1]);
 
+    testSimulationCPU(simN);
+
     printf("Number of Simulations %d", simN);
 
-    testSimulationGPU(simN);
+    //testSimulationGPU(simN);
 }
