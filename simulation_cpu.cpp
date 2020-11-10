@@ -6,6 +6,11 @@
 
 #define _TIMEPOINTS 51
 
+struct __float2 {
+    float x;
+    float y;
+};
+
 /*
 * Musiela SDE
 */
@@ -46,10 +51,12 @@ void __initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
  * Monte Carlo HJM Path Generation
 */
 
-void __generatePaths_kernel(float* numeraires, int timepoints, float* spot_rates, float* drifts, float* volatilities, float dtau, float* rngNrmVar, const int pathN)
+void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_rates, float* drifts, float* volatilities, float* rngNrmVar, const int pathN, float dtau = 0.5, float dt = 0.01)
 {
     // Simulated forward Curve
     static float simulated_rates[_TIMEPOINTS];
+    static float simulated_rates0[_TIMEPOINTS];
+    static float accum_rates[_TIMEPOINTS];
 
     // Normal variates
     float phi0;
@@ -60,15 +67,13 @@ void __generatePaths_kernel(float* numeraires, int timepoints, float* spot_rates
     float rate;
 
     // Simulation Parameters
-    float dt = 0.01; // 
     int stride = dtau / dt; // 
     const float sqrt_dt = sqrt(dt);
     int sim_blck_count = pathN / stride;
 
     // Simulation Results
-    float forward_rate;
-    float discount_factor;
-    float accum_rates;
+    float forward_rate = 0.0;
+    float discount_factor = 0.0;
 
     // Initialize simulated_rates with the spot_rate values
     for (int t = 0; t < _TIMEPOINTS; t++) {
@@ -81,19 +86,19 @@ void __generatePaths_kernel(float* numeraires, int timepoints, float* spot_rates
         for (int sim = 1; sim <= stride; sim++)
         {
             //  initialize the random numbers phi0, phi1, phi2 for the simulation (sim) for each t,  t[i] = t[i-1] + dt
-            phi0 = rngNrmVar[sim];
-            phi1 = rngNrmVar[sim + 1];
-            phi1 = rngNrmVar[sim + 2];
+            phi0 = rngNrmVar[sim - 1];
+            phi1 = rngNrmVar[sim];
+            phi2 = rngNrmVar[sim + 1];
 
             for (int t = 0; t < _TIMEPOINTS; t++) 
             {
                 float dF = 0.0;
 
-                if (t < (_TIMEPOINTS - 1)) {
-                    dF = simulated_rates[t + 1] - simulated_rates[t];
+                if (t == (_TIMEPOINTS - 1)) {
+                    dF = simulated_rates[t] - simulated_rates[t-1];
                 }
                 else {
-                    dF = simulated_rates[t] - simulated_rates[t - 1];
+                    dF = simulated_rates[t+1] - simulated_rates[t];
                 }
 
                 rate = __musiela_sde(
@@ -112,19 +117,40 @@ void __generatePaths_kernel(float* numeraires, int timepoints, float* spot_rates
                 );
 
                 // accumulate rate for discount calculation
-                accum_rates += rate;
+                accum_rates[t] += rate;
 
                 // store the simulated rate
-                simulated_rates[t] = rate;
+                simulated_rates0[t] = rate;
             }
-        }
 
-        // update numeraire based on simulation block delta
+            // update simulated rates
+            for (int t = 0; t < _TIMEPOINTS; t++)
+            {
+                simulated_rates[t] = simulated_rates0[t];
+            }
+
+            // DEBUG
+            printf("%d - %d ", sim_blck, sim);
+            for (int t = 0; t < _TIMEPOINTS; t++)
+            {
+                printf("%f ", simulated_rates[t]);
+            }
+            printf("    %f %f %f \n", phi0, phi1, phi2);
+        } 
+
+        // update numeraire based on simulation block 
         forward_rate = rate;
-        discount_factor = exp(-accum_rates * dt);
+        discount_factor = exp(-accum_rates[sim_blck] * dt);
 
-        numeraires[0] = forward_rate;
-        numeraires[0 + 1] = discount_factor;
+        numeraires[sim_blck].x = forward_rate;
+        numeraires[sim_blck].y = discount_factor;
+    }
+
+    // DEBUG
+    printf("Forward Rates/ Discount Factors \n");
+    for (int t = 0; t < _TIMEPOINTS; t++)
+    {
+        printf("%f %f \n", numeraires[t].x, numeraires[t].y);
     }
 }
 
@@ -133,7 +159,7 @@ void __generatePaths_kernel(float* numeraires, int timepoints, float* spot_rates
  * Exposure generation kernel
  * one to one mapping between threadIdx.x and tenor
  */
-void __reduceExposure_kernel(float* exposure, float* numeraires, const float notional, const float K, float* accrual, int simN)
+void __reduceExposure_kernel(float* exposure, __float2* numeraires, const float notional, const float K, float* accrual, int simN)
 {
     static float cash_flows[_TIMEPOINTS];
     float discount_factor;
@@ -144,8 +170,8 @@ void __reduceExposure_kernel(float* exposure, float* numeraires, const float not
     for (int s = 0; s < simN; s++) {
         // Calculate the Cashflows across tenors
         for (int t = 0; t < _TIMEPOINTS; t++) {
-            forward_rate = numeraires[t];
-            discount_factor = numeraires[t + 1];
+            forward_rate = numeraires[t].x;
+            discount_factor = numeraires[t].y;
             cash_flows[t] = discount_factor * notional * accrual[t] * (forward_rate - K);
         }
         // Compute the IRS Mark to Market
@@ -206,32 +232,50 @@ void cpuMatrix2DReduceAvg(float* expected_exposure, float* exposures, int simN) 
 /*
  * Exposure Calculation Kernel Invocation
 */
-void calculateExposureCPU(/*float* expected_exposure*/ float* exposures, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int simN) 
+void calculateExposureCPU(/*float* expected_exposure*/ float* exposures, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int simN) //dt, dtau
 {
-    // Generate the normal distributed variates
-    // initialize 
-    float* rngNrmVar = 0;
-    // __initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
+    // Allocate Expected Exposure profile
+    float* expected_exposure = 0;
+    expected_exposure = (float*) malloc(_TIMEPOINTS * sizeof(float));
 
     // Iterate across all simulations
-    int pathN = 2500; // HJM Model number of paths
+    int pathN = 2500; // HJM Model simulation paths number
+    int rnd_count = simN * pathN * 3; //
+
+    // Allocate numeraires (forward_rate, discount_factor)
+    __float2* numeraires = 0;
+    numeraires = (__float2*) malloc(rnd_count * sizeof(__float2));
+
+    // Generate the normal distributed variates
+    float* rngNrmVar = 0;
+    rngNrmVar = (float*) malloc(rnd_count * sizeof(float));
+
+
+    // normal distributed variates generation
+    __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
 
     for (int s = 0; s < simN; s++) {
-        //__generatePaths_kernel(float* numeraires, int timepoints, float* spot_rates, float* drifts, float* volatilities, float dtau, float* rngNrmVar, const int pathN)
+        __generatePaths_kernel(numeraires, _TIMEPOINTS, spot_rates, drift, volatilities, rngNrmVar, pathN); //dt, dtau
         //__reduceExposure_kernel(float* exposure, float* numeraires, const float notional, const float K, float* accrual, int simN)
     }
 
-    // Expected Exposure profile
-    float* expected_exposure = 0;
-
     // Calculate the Expected Exposure Profile
-    cpuMatrix2DReduceAvg(expected_exposure, exposures, simN);
+    //cpuMatrix2DReduceAvg(expected_exposure, exposures, simN);
+
 
     // free resources
     if (rngNrmVar) {
         free(rngNrmVar);
     }
 
+    if (numeraires) {
+        free(numeraires);
+    }
+
+    if (expected_exposure) {
+        free(expected_exposure);
+    }
+
     /* Printing results */
-    std::cout << "Sample mean of normal distribution = " << std::endl;
+    //std::cout << "Sample mean of normal distribution = " << std::endl;
 }
