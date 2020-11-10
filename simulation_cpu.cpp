@@ -71,18 +71,18 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
     const float sqrt_dt = sqrt(dt);
     int sim_blck_count = pathN / stride;
 
-    // Simulation Results
-    float forward_rate = 0.0;
-    float discount_factor = 0.0;
-
     // Initialize simulated_rates with the spot_rate values
     for (int t = 0; t < _TIMEPOINTS; t++) {
         simulated_rates[t] = spot_rates[t];
     }
 
+    numeraires[0].x = simulated_rates[0];
+    numeraires[0].y = exp(-simulated_rates[0] * dt);
+
     //  HJM SDE Simulation
     for (int sim_blck = 0; sim_blck < sim_blck_count; sim_blck++)
     {
+
         for (int sim = 1; sim <= stride; sim++)
         {
             //  initialize the random numbers phi0, phi1, phi2 for the simulation (sim) for each t,  t[i] = t[i-1] + dt
@@ -139,11 +139,8 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
         } 
 
         // update numeraire based on simulation block 
-        forward_rate = rate;
-        discount_factor = exp(-accum_rates[sim_blck] * dt);
-
-        numeraires[sim_blck].x = forward_rate;
-        numeraires[sim_blck].y = discount_factor;
+        numeraires[sim_blck+1].x = simulated_rates[sim_blck + 1];
+        numeraires[sim_blck+1].y = exp(-accum_rates[sim_blck] * dt);
     }
 
     // DEBUG
@@ -255,7 +252,7 @@ void calculateExposureCPU(/*float* expected_exposure*/ float* exposures, Interes
     __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
 
     for (int s = 0; s < simN; s++) {
-        __generatePaths_kernel(numeraires, _TIMEPOINTS, spot_rates, drift, volatilities, rngNrmVar, pathN); //dt, dtau
+        __generatePaths_kernel(numeraires, _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[ s*pathN*3 ], pathN); //dt, dtau
         //__reduceExposure_kernel(float* exposure, float* numeraires, const float notional, const float K, float* accrual, int simN)
     }
 
