@@ -12,18 +12,18 @@ struct __float2 {
 };
 
 /*
-* Musiela SDE
+* SDE
+* We simulate f(t+dt)=f(t) + dfbar   where SDE dfbar =  m(t)*dt+SUM(Vol_i*phi*SQRT(dt))+dF/dtau*dt (Musiela Parameterisaiton HJM SDE)
 */
 float __musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0, float phi1, float phi2, float sqrt_dt, float dF, float rate0, float dtau, float dt) {
 
-    float v0 = (vol0 * phi0) * sqrt_dt;
-    float v1 = (vol1 * phi1) * sqrt_dt;
-    float v2 = (vol2 * phi2) * sqrt_dt;
+    float vol_sum = vol0 * phi0;
+    vol_sum += vol1 * phi1;
+    vol_sum += vol2 * phi2;
+    vol_sum *= sqrt(dt);
 
     float dfbar = drift * dt;
-    dfbar += v0;
-    dfbar += v1;
-    dfbar += v2;
+    dfbar += vol_sum;
 
     dfbar += (dF / dtau) * dt;
 
@@ -41,9 +41,28 @@ float __musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0,
 void __initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
 {
    VSLStreamStatePtr stream;
-   vslNewStream(&stream, VSL_BRNG_MT19937, 777);
+   //vslNewStream(&stream, VSL_BRNG_MT19937, 777);
+   vslNewStream(&stream, VSL_BRNG_MRG32K3A, 777);
+   //vslNewStream(&stream, VSL_BRNG_SOBOL, 777);
    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, rnd_count, rngNrmVar, 0.0, 1.0);
    vslDeleteStream(&stream);
+}
+
+/*
+ Calculate dF term in Musiela Parametrization SDE
+*/
+
+inline float dFau(int t, int timepoints, float* rates) {
+    float result = 0.0;
+
+    if (t == (timepoints - 1)) {
+        result = rates[t] - rates[t - 1];
+    }
+    else {
+        result = rates[t + 1] - rates[t];
+    }
+
+    return result;
 }
 
 
@@ -86,20 +105,13 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
         for (int sim = 1; sim <= stride; sim++)
         {
             //  initialize the random numbers phi0, phi1, phi2 for the simulation (sim) for each t,  t[i] = t[i-1] + dt
-            phi0 = rngNrmVar[sim - 1];
-            phi1 = rngNrmVar[sim];
-            phi2 = rngNrmVar[sim + 1];
+            phi0 = rngNrmVar[sim_blck*stride + sim*3];
+            phi1 = rngNrmVar[sim_blck*stride + sim*3 + 1];
+            phi2 = rngNrmVar[sim_blck*stride + sim*3 + 2];
 
             for (int t = 0; t < _TIMEPOINTS; t++) 
             {
-                float dF = 0.0;
-
-                if (t == (_TIMEPOINTS - 1)) {
-                    dF = simulated_rates[t] - simulated_rates[t-1];
-                }
-                else {
-                    dF = simulated_rates[t+1] - simulated_rates[t];
-                }
+                float dF = dFau(t, _TIMEPOINTS, simulated_rates);
 
                 rate = __musiela_sde(
                     drifts[t],
@@ -156,7 +168,7 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
  * Exposure generation kernel
  * one to one mapping between threadIdx.x and tenor
  */
-void __reduceExposure_kernel(float* exposure, __float2* numeraires, const float notional, const float K, float* accrual, int simN)
+void __calculateExposure_kernel(float* exposure, __float2* numeraires, const float notional, const float K, float* accrual, int simN)
 {
     static float cash_flows[_TIMEPOINTS];
     float discount_factor;
@@ -165,12 +177,14 @@ void __reduceExposure_kernel(float* exposure, __float2* numeraires, const float 
 
     // For each Simulation
     for (int s = 0; s < simN; s++) {
+
         // Calculate the Cashflows across tenors
         for (int t = 0; t < _TIMEPOINTS; t++) {
             forward_rate = numeraires[t].x;
             discount_factor = numeraires[t].y;
             cash_flows[t] = discount_factor * notional * accrual[t] * (forward_rate - K);
         }
+
         // Compute the IRS Mark to Market
         for (int t = 0; t <= _TIMEPOINTS; t++) {
             sum = 0.0;
@@ -185,9 +199,14 @@ void __reduceExposure_kernel(float* exposure, __float2* numeraires, const float 
 
 
 /*
-* Aggregation
+* Expected Exposure profile is defined as the positive average across all simulations on each pricing point 
+* For simplicity each tenor point [0..50] has been considered as a pricing point
+* Rather than performing an aggreation (summation) on each column of the exposure matrix (tenors, simulations)
+* a BLAS library function cblas_sgemv is used instead. Basically the exposure matrix multiplied by a vector
+* of 1 values perform the summation on each column for averaging purpuse. As described bellow:
+* matrix (tenors, simulations) x (simulations, 1) . The final result is a reduced vector with dimention (tenors, 1)
 */
-void cpuMatrix2DReduceAvg(float* expected_exposure, float* exposures, int simN) {
+void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposures, int simN) {
 
     float* d_x = 0;;
     float* d_y = 0;
@@ -207,7 +226,6 @@ void cpuMatrix2DReduceAvg(float* expected_exposure, float* exposures, int simN) 
     const MKL_INT incy = 1;
     const float beta = 0.0;
 
-    // Matrix Vector Multiplication to Reduce a Matrix by columns
     cblas_sgemv(CblasRowMajor, CblasNoTrans, _TIMEPOINTS, simN, alpha, exposures, lda, d_x, incx, beta, d_y, incy);
 
     // copy the results back
@@ -229,11 +247,9 @@ void cpuMatrix2DReduceAvg(float* expected_exposure, float* exposures, int simN) 
 /*
  * Exposure Calculation Kernel Invocation
 */
-void calculateExposureCPU(/*float* expected_exposure*/ float* exposures, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int simN) //dt, dtau
+void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int _simN) //dt, dtau
 {
-    // Allocate Expected Exposure profile
-    float* expected_exposure = 0;
-    expected_exposure = (float*) malloc(_TIMEPOINTS * sizeof(float));
+    int simN = 1;
 
     // Iterate across all simulations
     int pathN = 2500; // HJM Model simulation paths number
@@ -241,38 +257,42 @@ void calculateExposureCPU(/*float* expected_exposure*/ float* exposures, Interes
 
     // Allocate numeraires (forward_rate, discount_factor)
     __float2* numeraires = 0;
-    numeraires = (__float2*) malloc(rnd_count * sizeof(__float2));
+    numeraires = (__float2*) malloc(_TIMEPOINTS * simN * sizeof(__float2));
+
+    float* exposures = 0;
+    exposures = (float*)malloc(_TIMEPOINTS * simN * sizeof(float));
 
     // Generate the normal distributed variates
     float* rngNrmVar = 0;
     rngNrmVar = (float*) malloc(rnd_count * sizeof(float));
 
-
     // normal distributed variates generation
     __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
 
     for (int s = 0; s < simN; s++) {
-        __generatePaths_kernel(numeraires, _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[ s*pathN*3 ], pathN); //dt, dtau
-        //__reduceExposure_kernel(float* exposure, float* numeraires, const float notional, const float K, float* accrual, int simN)
+        __generatePaths_kernel(numeraires, _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[s*pathN*3], pathN); //dt = 0.01, dtau = 0.5
+        __calculateExposure_kernel(exposures, numeraires, payOff.notional, payOff.K, accrual, simN);
+    }
+
+    printf("Exposures \n");
+    for (int t = 0; t < _TIMEPOINTS; t++)
+    {
+        printf("%f ", exposures[t]);
     }
 
     // Calculate the Expected Exposure Profile
-    //cpuMatrix2DReduceAvg(expected_exposure, exposures, simN);
-
+    //__calculateExpectedExposure_kernel(expected_exposure, exposures, simN);
 
     // free resources
     if (rngNrmVar) {
-        free(rngNrmVar);
+      free(rngNrmVar);
     }
 
     if (numeraires) {
         free(numeraires);
     }
 
-    if (expected_exposure) {
-        free(expected_exposure);
-    }
-
-    /* Printing results */
-    //std::cout << "Sample mean of normal distribution = " << std::endl;
+    //if (exposures) {
+    //    free(exposures);
+    //}
 }
