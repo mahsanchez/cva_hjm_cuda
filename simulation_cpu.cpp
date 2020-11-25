@@ -6,6 +6,11 @@
 
 #define _TIMEPOINTS 51
 
+#undef DEBUG_HJM_SIM
+#undef DEBUG_NUMERAIRE
+#define DEBUG_EXPOSURE
+#define DEBUG_EXPECTED_EXPOSURE
+
 struct __float2 {
     float x;
     float y;
@@ -42,8 +47,8 @@ void __initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
 {
    VSLStreamStatePtr stream;
    //vslNewStream(&stream, VSL_BRNG_MT19937, 777);
-   vslNewStream(&stream, VSL_BRNG_MRG32K3A, 777);
-   //vslNewStream(&stream, VSL_BRNG_SOBOL, 777);
+   //vslNewStream(&stream, VSL_BRNG_MRG32K3A, 777);
+   vslNewStream(&stream, VSL_BRNG_SOBOL, 777);
    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, rnd_count, rngNrmVar, 0.0, 1.0);
    vslDeleteStream(&stream);
 }
@@ -95,6 +100,25 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
         simulated_rates[t] = spot_rates[t];
     }
 
+    // reset internal buffers
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        simulated_rates0[t] = 0.0;
+    }
+
+    // reset accumulators
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        accum_rates[t] = 0.0;
+    }
+
+#ifdef DEBUG_HJM_SIM
+    printf("spot rates\n");
+    for (int t = 0; t < _TIMEPOINTS; t++)
+    {
+        printf("%f ", simulated_rates[t]);
+    }
+    printf("\n");
+#endif
+
     numeraires[0].x = simulated_rates[0];
     numeraires[0].y = exp(-simulated_rates[0] * dt);
 
@@ -141,13 +165,14 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
                 simulated_rates[t] = simulated_rates0[t];
             }
 
-            // DEBUG
+#ifdef DEBUG_HJM_SIM
             printf("%d - %d ", sim_blck, sim);
             for (int t = 0; t < _TIMEPOINTS; t++)
             {
                 printf("%f ", simulated_rates[t]);
             }
             printf("    %f %f %f \n", phi0, phi1, phi2);
+#endif
         } 
 
         // update numeraire based on simulation block 
@@ -155,12 +180,13 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
         numeraires[sim_blck+1].y = exp(-accum_rates[sim_blck] * dt);
     }
 
-    // DEBUG
+#ifdef DEBUG_NUMERAIRE
     printf("Forward Rates/ Discount Factors \n");
     for (int t = 0; t < _TIMEPOINTS; t++)
     {
         printf("%f %f \n", numeraires[t].x, numeraires[t].y);
     }
+#endif
 }
 
 
@@ -249,7 +275,7 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
 */
 void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int _simN) //dt, dtau
 {
-    int simN = 1;
+    int simN = 500;
 
     // Iterate across all simulations
     int pathN = 2500; // HJM Model simulation paths number
@@ -270,18 +296,23 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
 
     for (int s = 0; s < simN; s++) {
-        __generatePaths_kernel(numeraires, _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[s*pathN*3], pathN); //dt = 0.01, dtau = 0.5
-        __calculateExposure_kernel(exposures, numeraires, payOff.notional, payOff.K, accrual, simN);
+
+        __generatePaths_kernel(&numeraires[s * _TIMEPOINTS], _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[s*pathN*3], pathN); //dt = 0.01, dtau = 0.5
+        __calculateExposure_kernel(&exposures[s * _TIMEPOINTS], &numeraires[s * _TIMEPOINTS], payOff.notional, payOff.K, accrual, simN);
+
+#ifdef DEBUG_EXPOSURE
+        printf("Exposures \n");
+        for (int t = 0; t < _TIMEPOINTS; t++)
+        {
+            printf("%f ", exposures[s * _TIMEPOINTS + t]);
+        }
+#endif
     }
 
-    printf("Exposures \n");
-    for (int t = 0; t < _TIMEPOINTS; t++)
-    {
-        printf("%f ", exposures[t]);
-    }
 
     // Calculate the Expected Exposure Profile
-    //__calculateExpectedExposure_kernel(expected_exposure, exposures, simN);
+    __calculateExpectedExposure_kernel(expected_exposure, exposures, simN);
+
 
     // free resources
     if (rngNrmVar) {
@@ -292,7 +323,7 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
         free(numeraires);
     }
 
-    //if (exposures) {
-    //    free(exposures);
-    //}
+    if (exposures) {
+      //free(exposures);
+    }
 }
