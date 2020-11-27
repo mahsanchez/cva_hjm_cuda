@@ -8,8 +8,8 @@
 
 #undef DEBUG_HJM_SIM
 #undef DEBUG_NUMERAIRE
-#define DEBUG_EXPOSURE
-#define DEBUG_EXPECTED_EXPOSURE
+#undef DEBUG_EXPOSURE
+#undef DEBUG_EXPECTED_EXPOSURE
 
 struct __float2 {
     float x;
@@ -238,26 +238,36 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
     float* d_y = 0;
 
     d_x = (float*) malloc(simN * sizeof(float));
-    d_y = (float*) malloc(_TIMEPOINTS * sizeof(float));
-   
-    memset(d_x, 1.0, simN);
-    memset(d_y, 0.0, _TIMEPOINTS);
+    d_y = (float*) malloc(simN * sizeof(float));
+
+    // reset internal buffers
+    for (int i = 0; i < simN; i++) {
+        d_x[i] = 1.0;
+    }
+
+    for (int t = 0; t < simN; t++) {
+        d_y[t] = 0.0;
+    }
 
     // Parameters
-    const float alpha = 1.f / simN;
-    float cols = (float) _TIMEPOINTS;
-    float rows = (float) simN;
-    const MKL_INT lda = simN;
+    const MKL_INT m = simN;
+    const MKL_INT n = _TIMEPOINTS;
     const MKL_INT incx = 1;
     const MKL_INT incy = 1;
+    const float alpha = 1.f/simN;
     const float beta = 0.0;
 
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, _TIMEPOINTS, simN, alpha, exposures, lda, d_x, incx, beta, d_y, incy);
+    cblas_sgemv(CblasRowMajor, CblasTrans, m, n, alpha, exposures, n, d_x, incx, beta, d_y, incy);
+
+    printf("cblas_call\n");
 
     // copy the results back
-    for (int i = 0; i < _TIMEPOINTS; i++) {
-        expected_exposure[i] = d_y[i];
+    //memcpy(expected_exposure, d_y, _TIMEPOINTS * sizeof(float));
+    printf("expected exposure \n");
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        printf("%f ", d_y[t]);
     }
+    printf("\n");
 
     // free resource
     if (d_x) {
@@ -275,7 +285,8 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
 */
 void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int _simN) //dt, dtau
 {
-    int simN = 500;
+    //
+    int simN = 40;
 
     // Iterate across all simulations
     int pathN = 2500; // HJM Model simulation paths number
@@ -288,6 +299,9 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     float* exposures = 0;
     exposures = (float*)malloc(_TIMEPOINTS * simN * sizeof(float));
 
+    float* _expected_exposure = 0;
+    _expected_exposure = (float*) malloc(_TIMEPOINTS * sizeof(float));
+
     // Generate the normal distributed variates
     float* rngNrmVar = 0;
     rngNrmVar = (float*) malloc(rnd_count * sizeof(float));
@@ -296,22 +310,31 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
 
     for (int s = 0; s < simN; s++) {
-
         __generatePaths_kernel(&numeraires[s * _TIMEPOINTS], _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[s*pathN*3], pathN); //dt = 0.01, dtau = 0.5
         __calculateExposure_kernel(&exposures[s * _TIMEPOINTS], &numeraires[s * _TIMEPOINTS], payOff.notional, payOff.K, accrual, simN);
+    }
 
 #ifdef DEBUG_EXPOSURE
-        printf("Exposures \n");
+    printf("Exposures\n");
+    for (int s = 0; s < simN; s++) {
         for (int t = 0; t < _TIMEPOINTS; t++)
         {
             printf("%f ", exposures[s * _TIMEPOINTS + t]);
         }
-#endif
+        printf("\n");
     }
-
+#endif
 
     // Calculate the Expected Exposure Profile
-    __calculateExpectedExposure_kernel(expected_exposure, exposures, simN);
+    __calculateExpectedExposure_kernel(_expected_exposure, exposures, simN);
+
+#ifdef DEBUG_EXPECTED_EXPOSURE
+    printf("Expected Exposures \n");
+    for (int t = 0; t < _TIMEPOINTS; t++)
+    {
+        printf("%f ", _expected_exposure[t]);
+    }
+#endif
 
 
     // free resources
@@ -325,5 +348,9 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
 
     if (exposures) {
       //free(exposures);
+    }
+
+    if (_expected_exposure) {
+        //free(_expected_exposure);
     }
 }
