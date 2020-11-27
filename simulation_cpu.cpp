@@ -9,7 +9,7 @@
 #undef DEBUG_HJM_SIM
 #undef DEBUG_NUMERAIRE
 #undef DEBUG_EXPOSURE
-#undef DEBUG_EXPECTED_EXPOSURE
+#define DEBUG_EXPECTED_EXPOSURE
 
 struct __float2 {
     float x;
@@ -261,21 +261,18 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
 
     printf("cblas_call\n");
 
-    // copy the results back
-    //memcpy(expected_exposure, d_y, _TIMEPOINTS * sizeof(float));
-    printf("expected exposure \n");
     for (int t = 0; t < _TIMEPOINTS; t++) {
-        printf("%f ", d_y[t]);
+        expected_exposure[t] = d_y[t];
     }
     printf("\n");
 
     // free resource
     if (d_x) {
-        free(d_x);
+       // free(d_x);
     }
 
     if (d_y) {
-        free(d_y);
+        //free(d_y);
     }
 }
 
@@ -286,7 +283,7 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
 void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int _simN) //dt, dtau
 {
     //
-    int simN = 40;
+    int simN = 5;
 
     // Iterate across all simulations
     int pathN = 2500; // HJM Model simulation paths number
@@ -347,10 +344,10 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     }
 
     if (exposures) {
-      //free(exposures);
+      free(exposures);
     }
 
     if (_expected_exposure) {
-        //free(_expected_exposure);
+        free(_expected_exposure);
     }
 }
