@@ -6,10 +6,10 @@
 
 #define _TIMEPOINTS 51
 
-#undef DEBUG_HJM_SIM
-#undef DEBUG_NUMERAIRE
+#define DEBUG_HJM_SIM
+#define DEBUG_NUMERAIRE
 #undef DEBUG_EXPOSURE
-#define DEBUG_EXPECTED_EXPOSURE
+#undef DEBUG_EXPECTED_EXPOSURE
 
 struct __float2 {
     float x;
@@ -75,13 +75,13 @@ inline float dFau(int t, int timepoints, float* rates) {
  * Monte Carlo HJM Path Generation
 */
 
-void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_rates, float* drifts, float* volatilities, float* rngNrmVar, const int pathN, float dtau = 0.5, float dt = 0.01)
+void __generatePaths_kernel(__float2* numeraires, int timepoints,
+    float* spot_rates, float* drifts, float* volatilities, 
+    float* rngNrmVar, 
+    float* simulated_rates, float* simulated_rates0, float* accum_rates,
+    const int pathN, float dtau = 0.5, float dt = 0.01
+)
 {
-    // Simulated forward Curve
-    static float simulated_rates[_TIMEPOINTS];
-    static float simulated_rates0[_TIMEPOINTS];
-    static float accum_rates[_TIMEPOINTS];
-
     // Normal variates
     float phi0;
     float phi1;
@@ -95,43 +95,17 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
     const float sqrt_dt = sqrt(dt);
     int sim_blck_count = pathN / stride;
 
-    // Initialize simulated_rates with the spot_rate values
-    for (int t = 0; t < _TIMEPOINTS; t++) {
-        simulated_rates[t] = spot_rates[t];
-    }
-
-    // reset internal buffers
-    for (int t = 0; t < _TIMEPOINTS; t++) {
-        simulated_rates0[t] = 0.0;
-    }
-
-    // reset accumulators
-    for (int t = 0; t < _TIMEPOINTS; t++) {
-        accum_rates[t] = 0.0;
-    }
-
-#ifdef DEBUG_HJM_SIM
-    printf("spot rates\n");
-    for (int t = 0; t < _TIMEPOINTS; t++)
-    {
-        printf("%f ", simulated_rates[t]);
-    }
-    printf("\n");
-#endif
-
+    // initialize numeraires
     numeraires[0].x = simulated_rates[0];
     numeraires[0].y = exp(-simulated_rates[0] * dt);
 
     //  HJM SDE Simulation
-    for (int sim_blck = 0; sim_blck < sim_blck_count; sim_blck++)
-    {
-
-        for (int sim = 1; sim <= stride; sim++)
+    for (int sim = 1; sim <= pathN; sim++)
         {
             //  initialize the random numbers phi0, phi1, phi2 for the simulation (sim) for each t,  t[i] = t[i-1] + dt
-            phi0 = rngNrmVar[sim_blck*stride + sim*3];
-            phi1 = rngNrmVar[sim_blck*stride + sim*3 + 1];
-            phi2 = rngNrmVar[sim_blck*stride + sim*3 + 2];
+            phi0 = rngNrmVar[sim*3];
+            phi1 = rngNrmVar[sim*3 + 1];
+            phi2 = rngNrmVar[sim*3 + 2];
 
             for (int t = 0; t < _TIMEPOINTS; t++) 
             {
@@ -159,36 +133,37 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints, float* spot_ra
                 simulated_rates0[t] = rate;
             }
 
-            // update simulated rates
-            for (int t = 0; t < _TIMEPOINTS; t++)
-            {
-                simulated_rates[t] = simulated_rates0[t];
+            // update numeraire based on simulation block 
+            if (sim % stride == 0) {
+                int lindex = sim / stride;
+                numeraires[lindex].x = simulated_rates0[lindex];
+                numeraires[lindex].y = exp(-accum_rates[lindex] * dt);
             }
+
+            // update simulated rates (swap pointers)
+            float* temp = simulated_rates;
+            simulated_rates = simulated_rates0;
+            simulated_rates0 = temp;
+
 
 #ifdef DEBUG_HJM_SIM
-            printf("%d - %d ", sim_blck, sim);
-            for (int t = 0; t < _TIMEPOINTS; t++)
-            {
-                printf("%f ", simulated_rates[t]);
+            if (sim % stride == 0) {
+                printf("%d - ", sim);
+                for (int t = 0; t < _TIMEPOINTS; t++)
+                {
+                    printf("%f ", simulated_rates[t]);
+                }
+                printf("    %f %f %f \n", phi0, phi1, phi2);
             }
-            printf("    %f %f %f \n", phi0, phi1, phi2);
 #endif
-        } 
 
-        // update numeraire based on simulation block 
-        numeraires[sim_blck+1].x = simulated_rates[sim_blck + 1];
-        numeraires[sim_blck+1].y = exp(-accum_rates[sim_blck] * dt);
-    }
+        }
+} 
 
-#ifdef DEBUG_NUMERAIRE
-    printf("Forward Rates/ Discount Factors \n");
-    for (int t = 0; t < _TIMEPOINTS; t++)
-    {
-        printf("%f %f \n", numeraires[t].x, numeraires[t].y);
-    }
-#endif
-}
-
+        
+        
+        
+   
 
 /*
  * Exposure generation kernel
@@ -232,22 +207,7 @@ void __calculateExposure_kernel(float* exposure, __float2* numeraires, const flo
 * of 1 values perform the summation on each column for averaging purpuse. As described bellow:
 * matrix (tenors, simulations) x (simulations, 1) . The final result is a reduced vector with dimention (tenors, 1)
 */
-void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposures, int simN) {
-
-    float* d_x = 0;;
-    float* d_y = 0;
-
-    d_x = (float*) malloc(simN * sizeof(float));
-    d_y = (float*) malloc(simN * sizeof(float));
-
-    // reset internal buffers
-    for (int i = 0; i < simN; i++) {
-        d_x[i] = 1.0;
-    }
-
-    for (int t = 0; t < simN; t++) {
-        d_y[t] = 0.0;
-    }
+void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposures, float* d_x, float* d_y, int simN) {
 
     // Parameters
     const MKL_INT m = simN;
@@ -257,6 +217,10 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
     const float alpha = 1.f/simN;
     const float beta = 0.0;
 
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        d_y[t] = 0.0;
+    }
+
     cblas_sgemv(CblasRowMajor, CblasTrans, m, n, alpha, exposures, n, d_x, incx, beta, d_y, incy);
 
     printf("cblas_call\n");
@@ -264,15 +228,29 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
     for (int t = 0; t < _TIMEPOINTS; t++) {
         expected_exposure[t] = d_y[t];
     }
-    printf("\n");
 
-    // free resource
-    if (d_x) {
-       // free(d_x);
+    int a = 0;
+
+}
+
+/*
+ * Initialize auxiliary vectors used during the simulation
+ */
+void __initVectors_kernel(float* simulated_rates, float* simulated_rates0, float* accum_rates, float *spot_rates, float dt) {
+
+    // Initialize simulated_rates with the spot_rate values
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        simulated_rates[t] = spot_rates[t];
     }
 
-    if (d_y) {
-        //free(d_y);
+    // reset internal buffers
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        simulated_rates0[t] = 0.0;
+    }
+
+    // reset accumulators
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        accum_rates[t] = 0.0;
     }
 }
 
@@ -285,19 +263,38 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     //
     int simN = 5;
 
-    // Iterate across all simulations
-    int pathN = 2500; // HJM Model simulation paths number
-    int rnd_count = simN * pathN * 3; //
+    //
+    float dt = 0.01;
+
+    // Auxiliary vectors
+    float* d_x = 0;;
+    float* d_y = 0;
+    d_x = (float*) malloc(simN * sizeof(float));
+    d_y = (float*) malloc(_TIMEPOINTS * sizeof(float));
 
     // Allocate numeraires (forward_rate, discount_factor)
     __float2* numeraires = 0;
     numeraires = (__float2*) malloc(_TIMEPOINTS * simN * sizeof(__float2));
 
     float* exposures = 0;
-    exposures = (float*)malloc(_TIMEPOINTS * simN * sizeof(float));
+    exposures = (float*) malloc(_TIMEPOINTS * simN * sizeof(float));
 
     float* _expected_exposure = 0;
     _expected_exposure = (float*) malloc(_TIMEPOINTS * sizeof(float));
+
+    // Simulated forward Curve
+    float* simulated_rates = (float*) malloc(_TIMEPOINTS * sizeof(float));;
+    float* simulated_rates0 = (float*) malloc(_TIMEPOINTS * sizeof(float));;
+    float* accum_rates = (float*) malloc(_TIMEPOINTS * sizeof(float));;
+
+    // initialize auxiliary vectors
+    for (int i = 0; i < simN; i++) {
+        d_x[i] = 1.0;
+    }
+
+    // Iterate across all simulations
+    int pathN = 2501; // HJM Model simulation paths number
+    int rnd_count = simN * pathN * 3; //
 
     // Generate the normal distributed variates
     float* rngNrmVar = 0;
@@ -306,10 +303,26 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     // normal distributed variates generation
     __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
 
+    // Monte Carlos Simulation Kernels for Exposure Generation
+
     for (int s = 0; s < simN; s++) {
-        __generatePaths_kernel(&numeraires[s * _TIMEPOINTS], _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[s*pathN*3], pathN); //dt = 0.01, dtau = 0.5
+        __initVectors_kernel(simulated_rates, simulated_rates0, accum_rates, spot_rates, dt);
+
+        __generatePaths_kernel(&numeraires[s * _TIMEPOINTS], _TIMEPOINTS, spot_rates, drift, volatilities, &rngNrmVar[s*pathN*3], simulated_rates, simulated_rates0, accum_rates, pathN); //dt = 0.01, dtau = 0.5
+        
+#ifdef DEBUG_NUMERAIRE
+        printf("Forward Rates/ Discount Factors \n");
+        for (int t = 0; t < _TIMEPOINTS; t++)
+        {
+            printf("%f %f \n", numeraires[t].x, numeraires[t].y);
+        }
+#endif
         __calculateExposure_kernel(&exposures[s * _TIMEPOINTS], &numeraires[s * _TIMEPOINTS], payOff.notional, payOff.K, accrual, simN);
     }
+
+    // Calculate the Expected Exposure Profile
+    __calculateExpectedExposure_kernel(_expected_exposure, exposures, d_x, d_y, simN);
+
 
 #ifdef DEBUG_EXPOSURE
     printf("Exposures\n");
@@ -322,9 +335,6 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     }
 #endif
 
-    // Calculate the Expected Exposure Profile
-    __calculateExpectedExposure_kernel(_expected_exposure, exposures, simN);
-
 #ifdef DEBUG_EXPECTED_EXPOSURE
     printf("Expected Exposures \n");
     for (int t = 0; t < _TIMEPOINTS; t++)
@@ -333,21 +343,40 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     }
 #endif
 
-
     // free resources
+    if (d_x) {
+  //      free(d_x);
+    }
+
+    if (d_y) {
+  //      free(d_y);
+    }
+
     if (rngNrmVar) {
-      free(rngNrmVar);
+       free(rngNrmVar);
     }
 
     if (numeraires) {
-        free(numeraires);
+       free(numeraires);
+    }
+
+    if (simulated_rates) {
+      //free( simulated_rates);
+    }
+
+    if (simulated_rates0) {
+       // free(simulated_rates0);
+    }
+
+    if (accum_rates) {
+       // free(accum_rates); 
     }
 
     if (exposures) {
-      free(exposures);
+   //   free(exposures);
     }
 
     if (_expected_exposure) {
-        free(_expected_exposure);
+  //     free(_expected_exposure);
     }
 }
