@@ -2,6 +2,7 @@
 #include <cublas_v2.h>
 #include <stdlib.h>
 #include <math.h>
+#include <chrono>
 
 #include <cuda_runtime.h>
 #include <curand.h>
@@ -10,12 +11,10 @@
 #include <helper_cuda.h>
 
 #include <iostream>
-#include <omp.h>
 
 #include "simulation_gpu.h"
 
 #define FULL_MASK 0xffffffff
-
 #define TILE_DIM 51
 #define TIMEPOINTS 51
 #define VOL_DIM 3
@@ -24,27 +23,79 @@
 #define MAX_BLOCK_SZ 256
 #define BATCH_SZ 1000
 
-#define HJM_SDE_DEBUG1
+#undef HJM_SDE_DEBUG
 #define MC_RDM_DEBUG
 #define HJM_NUMERAIRE_DEBUG
 #define EXPOSURE_PROFILES_DEBUG
 #define DEV_CURND_HOSTGEN
 #define EXPOSURE_PROFILES_AGGR_DEBUG
-#define CONST_MEMORY1
+#undef CONST_MEMORY
+#define RNG_HOST_API
+#undef RNG_DEV_API
 
-// Constant Memory allocation
-#ifdef CONST_MEMORY
-    __constant__ float d_accrual[TIMEPOINTS];
-    __constant__ float d_spot_rates[TIMEPOINTS];
-    __constant__ float d_drifts[TIMEPOINTS];
-    __constant__ float d_volatilities[VOL_DIM * TIMEPOINTS];
-#endif
+#define CUDA_RT_CALL(call)                                                                  \
+    {                                                                                       \
+        cudaError_t cudaStatus = call;                                                      \
+        if (cudaSuccess != cudaStatus)                                                      \
+            fprintf(stderr,                                                                 \
+                    "ERROR: CUDA RT call \"%s\" in line %d of file %s failed "              \
+                    "with "                                                                 \
+                    "%s (%d).\n",                                                           \
+                    #call, __LINE__, __FILE__, cudaGetErrorString(cudaStatus), cudaStatus); \
+    }
+
+
+#define CURAND_CALL(x)                                 \
+   {                                                   \
+        if((x)!=CURAND_STATUS_SUCCESS)                 \
+          printf("ERROR: CURAND call at %s:%d\n",__FILE__,__LINE__);\
+                                                       \
+    }  
+
 
 /*
  * Musiela Parametrization SDE
  * We simulate the SDE f(t+dt)=f(t) + dfbar  
  * where SDE dfbar =  m(t)*dt+SUM(Vol_i*phi[i]*SQRT(dt))+dF/dtau*dt and phi ~ N(0,1)
  */
+
+__device__
+float __musiela_sde2(float drift, float vol0, float vol1, float vol2, float phi0, float phi1, float phi2, float sqrt_dt, float dF, float rate0, float dtau, float dt) {
+
+    float vol_sum = vol0 * phi0;
+    vol_sum += vol1 * phi1;
+    vol_sum += vol2 * phi2;
+    vol_sum *= sqrtf(dt);
+
+    float dfbar = drift * dt;
+    dfbar += vol_sum;
+
+    dfbar += (dF / dtau) * dt;
+
+    // apply Euler Maruyana
+    float result = rate0 + dfbar;
+
+    return result;
+}
+
+/*
+ Calculate dF term in Musiela Parametrization SDE
+*/
+
+__device__
+inline float __dFau(int t, int timepoints, float* rates) {
+    float result = 0.0;
+
+    if (t == (timepoints - 1)) {
+        result = rates[t] - rates[t - 1];
+    }
+    else {
+        result = rates[t + 1] - rates[t];
+    }
+
+    return result;
+}
+
 
 __device__
 float musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0, float phi1, float phi2, float sqrt_dt, float dF, float rate0, float dtau, float dt) {
@@ -66,10 +117,22 @@ float musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0, f
     return result;
 }
 
+
 /**
 * * RNG init Kernel
 */
 
+#ifdef RNG_HOST_API
+void initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
+{
+    const float mean = 0.0;  const float stddev = 1.0;
+    curandGenerator_t generator;
+    CURAND_CALL( curandCreateGenerator(&generator, CURAND_RNG_QUASI_SOBOL32) );
+    CURAND_CALL( curandSetPseudoRandomGeneratorSeed(generator, seed) );
+    CURAND_CALL( curandGenerateNormal(generator, rngNrmVar, rnd_count, mean, stddev) );
+    CUDA_RT_CALL( cudaDeviceSynchronize() );
+}
+#else
 __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsigned int seed, int rnd_count)
 {
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -77,129 +140,76 @@ __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsi
     for (; index < rnd_count; index += blockDim.x * gridDim.x) {
         curand_init(seed, index, 0, &rngStates[index]);
     }
-   
 }
-
+#endif
 
 
 /*
- * Path generation kernel 
- * one to one mapping between threadIdx.x and tenor 
- */
+ * Monte Carlo HJM Path Generation
+*/
 __global__
-void generatePaths_kernel(float2* numeraires, int timepoints, float* spot_rates, float* drifts, float* volatilities, float dtau, curandStateMRG32k3a* const rngStates, const int pathN)
+void __generatePaths_kernel2(float2* numeraires, int timepoints,
+    float* drifts, float* volatilities, float* rngNrmVar,
+    float* simulated_rates, float* simulated_rates0, float* accum_rates,
+    const int pathN, int path, int nx, int ny, 
+    float dtau = 0.5, float dt = 0.01)
 {
-    __shared__ float simulated_rates[TIMEPOINTS];
-    // Compute Parameters
-    __shared__ float phi0;
-    __shared__ float phi1;
-    __shared__ float phi2;
+    // calculated rate
     float rate;
+
     // Simulation Parameters
-    float dt = 0.01; // 
-    int stride = dtau/dt; // 
-    const float sqrt_dt = sqrt(dt);
-    int sim_blck_count = pathN / stride;
-    int t = threadIdx.x;
-    // Simulation Results
-    float forward_rate;
-    float discount_factor;
-    float accum_rates;
-    float forward_rate1;
-    float discount_factor1;
-    float accum_rates1;
+    int stride = dtau / dt; // 
+    const float sqrt_dt = sqrtf(dt);
 
-    int globaltid = blockIdx.x * blockDim.x + threadIdx.x;
+    // Normal variates
+    float phi0 = rngNrmVar[path * 3];
+    float phi1 = rngNrmVar[path * 3 + 1];
+    float phi2 = rngNrmVar[path * 3 + 2];
 
-    // Initialize simulated_rates with the spot_rate values
-    if (threadIdx.x < timepoints) {
-        simulated_rates[threadIdx.x] = spot_rates[threadIdx.x];
-    }
-    __syncthreads();
+    const int t = threadIdx.x;
+    const int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    const int bindex = iy * nx;
+    const int gindex = bindex + ix;
 
-    //  HJM SDE Simulation
-    for (int sim_blck = 0; sim_blck < sim_blck_count; sim_blck++)
+    // int globaltid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Evolve the whole curve from 0 to T 
+    if (t < TIMEPOINTS)
     {
-        for (int sim = 1; sim <= stride; sim++)
-        {
-            //  initialize the random numbers phi0, phi1, phi2 for the simulation (sim) for each t,  t[i] = t[i-1] + dt
-            if (threadIdx.x == 0) {
-                phi0 = curand_normal( &rngStates[blockIdx.x * 3] );
-            }
-            else if (threadIdx.x == 1) {
-                phi1 = curand_normal( &rngStates[blockIdx.x * 3 + 1]);
-            }
-            else if (threadIdx.x == 2) {
-                phi2 = curand_normal( &rngStates[blockIdx.x * 3 + 2]);
-            }
+        float dF = __dFau(t, TIMEPOINTS, &simulated_rates[bindex]);
 
-            // TODO broadcast random values shfl_sync across the whole Warp
-            // synchronize threads block for next simulation step
-            __syncthreads();
-           
-#ifdef MC_RDM_DEBUG1
-            printf("BlockId %d Thread %d Random Normal Variates %f %f %f.\n", blockIdx.x, threadIdx.x, phi0, phi1, phi2);
-#endif
-            if (threadIdx.x < timepoints) {
-                // Musiela Parametrization SDE
-                float dF = 0.0;
+        rate = __musiela_sde2(
+            drifts[t],
+            volatilities[t],
+            volatilities[TIMEPOINTS + t],
+            volatilities[TIMEPOINTS * 2 + t],
+            phi0,
+            phi1,
+            phi2,
+            sqrt_dt,
+            dF,
+            simulated_rates[gindex],
+            dtau,
+            dt
+        );
 
-                if (t < (timepoints - 1)) {
-                    dF = simulated_rates[t + 1] - simulated_rates[t];
-                }
-                else {
-                    dF = simulated_rates[t] - simulated_rates[t - 1];
-                }
+        // accumulate rate for discount calculation
+        accum_rates[gindex] += rate;
 
-                rate = musiela_sde(
-                     drifts[t], 
-                     volatilities[t], 
-                     volatilities[timepoints + t], 
-                     volatilities[timepoints * 2 + t], 
-                     phi0, 
-                     phi1, 
-                     phi2, 
-                     sqrt_dt, 
-                     dF, 
-                     simulated_rates[t], 
-                     dtau, 
-                     dt
-                );
-
-                // accumulate rate for discount calculation
-                accum_rates += rate;
-            }
-
-            // Block all threads in the block till the whole forward rate have evolved across all tenors
-            __syncthreads();
-
-            // Upate the Forware Rate Curve at timepoint t for the next simulation
-            if (threadIdx.x < timepoints) {
-                
-                simulated_rates[t] = rate;
-            }
-
-            // synchronize threads block for next simulation step
-            __syncthreads();
-        }
-
-        // update numeraire based on simulation block delta
-        if ((threadIdx.x < timepoints) && (threadIdx.x == sim_blck))
-        {
-            forward_rate = rate;
-            discount_factor = exp(-accum_rates * dt);
-#ifdef HJM_NUMERAIRE_DEBUG1
-            printf("Thread %d sim_blck %d DiscountFactor %f ForwardRate %f.\n", threadIdx.x, sim_blck, discount_factor, forward_rate);
-#endif
-        }
-
+        // store the simulated rate
+        simulated_rates0[gindex] = rate;
     }
 
-    // write back in numeraire global memory the forward_rate and discount_factor value
-    if ( threadIdx.x < TIMEPOINTS ) {
-        numeraires[globaltid].x = forward_rate;
-        numeraires[globaltid].y = discount_factor;
+    // update numeraire based on simulation block 
+    if (path % stride == 0) {
+        if (t < TIMEPOINTS) {
+            int lindex = path / stride;
+            numeraires[lindex].x = simulated_rates0[bindex + lindex];
+            numeraires[lindex].y = exp(-accum_rates[bindex + lindex] * dt);
+        }
     }
+
 }
 
 
@@ -240,7 +250,7 @@ void gpuReduceExposure_kernel(float* exposure, float2* numeraires, const float n
         
             exposure[globaltid] = sum;
 
-    #ifdef MC_RDM_DEBUG1
+    #ifdef MC_RDM_DEBUG
             printf("Block %d Thread %d Exposure %f \n", blockIdx.x, threadIdx.x, sum);
     #endif
         }
@@ -321,205 +331,144 @@ void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
 /*
    Exposure Calculation Kernel Invocation
 */
-void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int _simN) {
+void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount) {
 
     //int _simN = 32000; // 1000; // 1000; // 1000; // 256; // 100; 1024
-    unsigned int curve_points_size_bytes = TIMEPOINTS * sizeof(float);
-    unsigned int total_curve_points_size_bytes = _simN * curve_points_size_bytes;
+    exposureCount = 1;
 
     // HJM Model number of paths
     int pathN = 2500;
 
     // Memory allocation 
-#ifndef CONST_MEMORY
     float* d_accrual = 0;
     float* d_spot_rates = 0;
     float* d_drifts = 0;
     float* d_volatilities = 0;
-#endif
     float2* d_numeraire = 0;
     float* d_exposures = 0;
-    curandStateMRG32k3a* rngStates = 0;
-
-    //
+    float* simulated_rates = 0;
+    float* simulated_rates0 = 0;
+    
+    // Select the GPU Device in a multigpu setup
     int gpu = 0;
     cudaSetDevice(gpu);
 
-    // Copy the spot_rates, drift & volatilities to device memory
-#ifndef CONST_MEMORY
-    checkCudaErrors(cudaMalloc((void**)&d_accrual, TIMEPOINTS * sizeof(float)));
-    checkCudaErrors(cudaMalloc((void**)&d_spot_rates, TIMEPOINTS * sizeof(float)));
-    checkCudaErrors(cudaMalloc((void**)&d_drifts, TIMEPOINTS * sizeof(float)));
-    checkCudaErrors(cudaMalloc((void**)&d_volatilities, VOL_DIM * TIMEPOINTS * sizeof(float)));
-#endif
+    // Global memory reservation for constant input data
+    CUDA_RT_CALL(cudaMalloc((void**)&d_numeraire, exposureCount * TIMEPOINTS * sizeof(float2)));  // Numeraire (discount_factor, forward_rates)
+    CUDA_RT_CALL(cudaMalloc((void**)&d_exposures, exposureCount * TIMEPOINTS * sizeof(float)));   // Exposure profiles
+    CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates, exposureCount * TIMEPOINTS * sizeof(float)));
+    CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates0, exposureCount * TIMEPOINTS * sizeof(float)));
 
-    // Rng buffer
-    checkCudaErrors(cudaMalloc((void**)&rngStates, VOL_DIM * _simN * sizeof(curandStateMRG32k3a)));
-
-    // Numeraire (discount_factor, forward_rates)
-    checkCudaErrors(cudaMalloc((void**)&d_numeraire, _simN * TIMEPOINTS * sizeof(float2)));
-
-    // Exposure profiles
-    checkCudaErrors(cudaMalloc((void**)&d_exposures, _simN * TIMEPOINTS * sizeof(float)));
-
-    const int curve_points_size_byte = TIMEPOINTS * sizeof(float);
-
-#ifdef CONST_MEMORY
-    cudaMemcpyToSymbol(d_accrual, accrual, curve_points_size_byte);
-    cudaMemcpyToSymbol(d_spot_rates, spot_rates, curve_points_size_byte);
-    cudaMemcpyToSymbol(d_drifts, drifts, curve_points_size_byte);
-    cudaMemcpyToSymbol(d_volatilities, volatilities, VOL_DIM * curve_points_size_byte);
-#endif 
+    // Global memory reservation for constant input data
+    CUDA_RT_CALL(cudaMalloc((void**)&d_accrual, TIMEPOINTS * sizeof(float)));  // accrual
+    CUDA_RT_CALL(cudaMalloc((void**)&d_spot_rates, TIMEPOINTS * sizeof(float)));  // spot_rates
+    CUDA_RT_CALL(cudaMalloc((void**)&d_drifts, TIMEPOINTS * sizeof(float)));  // drifts
+    CUDA_RT_CALL(cudaMalloc((void**)&d_volatilities, VOL_DIM * TIMEPOINTS * sizeof(float)));  // volatilities
 
     // Copy the spot_rates, drift & volatilities to device global memory Constant Memory TODO
-#ifndef CONST_MEMORY
-    checkCudaErrors(cudaMemcpy(d_accrual, accrual, curve_points_size_bytes, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_spot_rates, spot_rates, curve_points_size_bytes, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_drifts, drifts, curve_points_size_bytes, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_volatilities, volatilities, VOL_DIM * curve_points_size_bytes, cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemcpy(d_accrual, accrual, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemcpy(d_spot_rates, spot_rates, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemcpy(d_drifts, drifts, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaMemcpy(d_volatilities, volatilities, VOL_DIM * TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Global Memory reservation for RNG vector
+#ifdef RNG_HOST_API
+    float* rngNrmVar = 0;
+    int rngCount = exposureCount * VOL_DIM * pathN;
+    CUDA_RT_CALL(cudaMalloc((void**)&rngNrmVar, rngCount * sizeof(float)));
+#else
+    const int rngCount = VOL_DIM * exposureCount;
+    curandStateMRG32k3a* rngStates = 0;
+    CUDA_RT_CALL(cudaMalloc((void**)&rngStates, rngCount * sizeof(curandStateMRG32k3a)));
+    CUDA_RT_CALL(cudaDeviceSynchronize());
 #endif
 
-    // Device Properties
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, 0);
-
-    // Kernel Execution Configuration
-    int numBlocksPerSm = 0;
+    // Random Number Generation 
+    auto t_start = std::chrono::high_resolution_clock::now();
+#ifdef RNG_HOST_API
+    initRNG2_kernel(rngNrmVar, 1234ULL, rngCount);
+#else
     int blockSize = 1024;
-    int minGridSize;
-    int gridSize;
-    int rngCount = VOL_DIM * _simN;
-    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, initRNG2_kernel, 0, rngCount);
+    int gridSize = (rngCount + blockSize - 1) / blockSize;;
+    initRNG2_kernel << <gridSize, blockSize >> > (rngStates, 1234ULL, rngCount);
+#endif
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "time taken to generate " << elapsed_time_ms << "(ms) normal random floats" << std::endl;
 
-    // Round up according to array size
-    gridSize = (rngCount + blockSize - 1) / blockSize;
+    // Monte Carlo Simulation kernel execution configuration 
+    int exposureCount = 0;
+    dim3 dimBlock(64, 1, 1);
+    dim3 dimGrid(exposureCount, 1); // <- Grid Size exposureCount < 40 (Total number of SM RTX 2070)
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
+    // Monte Carlos Simulation HJM Kernels (2500 paths)//dt = 0.01, dtau = 0.5
+    for (int path = 1; path < pathN; path++)
+    {
+        __generatePaths_kernel <<<gridSize, blockSize >>> (
+            numeraires,
+            drift,
+            volatilities,
+            rngNrmVar,
+            simulated_rates,
+            simulated_rates0,
+            accum_rates,
+            pathN,
+            path
+        );  
+        CUDA_RT_CALL(cudaDeviceSynchronize());
 
-    initRNG2_kernel <<<gridSize, blockSize >>> (rngStates, 1234ULL, rngCount);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Rng Execution Time %fms\n", milliseconds);
-
-    int numBlocks;        // Occupancy in terms of active blocks
-    /// This will launch a grid that can maximally fill the GPU, on the default stream with kernel arguments
-    numBlocksPerSm = 0;
-    blockSize = 64;
-    cudaGetDeviceProperties(&deviceProp, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, generatePaths_kernel, blockSize, 0);
-    gridSize = deviceProp.multiProcessorCount * numBlocksPerSm;
-
-    printf("Max Occupancy on number of blocks %d \n", numBlocksPerSm);
-    printf("Max number of exposures profiles %d and simulations  %d \n", _simN, _simN * pathN);
-    printf("gridSize %d and blockSize %d \n", gridSize, blockSize);
-
-    // kernel execution configuration launch
-    dim3 dimBlock(blockSize, 1, 1);
-    dim3 dimGrid(gridSize, 1, 1);
-
-    float totalMilliseconds = 0;
-
-    // Accelerate MC Simulation - TODO launch kernels with streams
-    for (int i = 0; i < _simN; i += gridSize) {
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        cudaEventRecord(start);
-
-        generatePaths_kernel <<< dimGrid, dimBlock >>> (
-            &d_numeraire[i],
-            TIMEPOINTS,
-            d_spot_rates,
-            d_drifts,
-            d_volatilities,
-            payOff.dtau,
-            rngStates,
-            pathN
-         );
-
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        milliseconds = 0;
-        cudaEventElapsedTime(&milliseconds, start, stop);
-        totalMilliseconds += milliseconds;
-        printf("MC Simulation Execution Time %fms\n", milliseconds);
+        // update simulated rates (swap pointers)
+        std::swap(simulated_rates, simulated_rates0);
     }
 
-    printf("MC Simulation Total Execution Time %fms\n", totalMilliseconds);
-
-    // Exposure Calculation 
-
-    /// This will launch a grid that can maximally fill the GPU, on the default stream with kernel arguments
-    numBlocksPerSm = 0;
-    blockSize = 64;
-    cudaGetDeviceProperties(&deviceProp, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, gpuReduceExposure_kernel, blockSize, 0);
-    gridSize = deviceProp.multiProcessorCount * numBlocksPerSm;
-
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
-
-    gpuReduceExposure_kernel <<<dimGrid, dimBlock>>>(d_exposures, d_numeraire, payOff.notional, payOff.K, d_accrual, _simN);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    totalMilliseconds += milliseconds;
-    printf("Exposure Calculation  Time %fms\n", milliseconds);
-
-    // Average across all the exposures profiles to obtain the Expected Exposure Profile
-
-    // Done with MC Simulation 
-#ifdef HJM_SDE_DEBUG12
-    printf("MC Simulation completed");
-    goto release_resources;
-#endif
+    // Exposure Profile Calculation 
+    // gpuReduceExposure_kernel <<<dimGrid, dimBlock>>>(d_exposures, d_numeraire, payOff.notional, payOff.K, d_accrual, _simN);
+    // cudaDeviceSynchronize();
+    // printf("Exposure Calculation  Time %fms\n", milliseconds);
 
     // Expected Exposure Profile Calculation
     // Reduce all exposures realizations and average them to obtain the Expected Exposures (2D reduction on expsure matrix)
-    gpuSumReduceAvg(expected_exposure, d_exposures, _simN);
+    // gpuSumReduceAvg(expected_exposure, d_exposures, _simN);
 
-#ifdef HJM_SDE_DEBUG1
-    printf("Expected Exposure Calculated");
-#endif
-
-release_resources:
 
     if (d_numeraire) {
-        cudaFree(d_numeraire);
+        CUDA_RT_CALL( cudaFree(d_numeraire) );
     }
   
+#ifdef RNG_HOST_API
+    CUDA_RT_CALL(cudaFree(rngNrmVar));
+#else
     if (rngStates) {
-        cudaFree(rngStates);
+        CUDA_RT_CALL(cudaFree(rngStates));
     }
+#endif
 
-#ifndef CONST_MEMORY
     if (d_accrual) {
-        cudaFree(d_accrual);
+        CUDA_RT_CALL(cudaFree(d_accrual));
     }
 
     if (d_spot_rates) {
-        cudaFree(d_spot_rates);
+        CUDA_RT_CALL(cudaFree(d_spot_rates));
     }
 
     if (d_drifts) {
-        cudaFree(d_drifts);
+        CUDA_RT_CALL(cudaFree(d_drifts));
     }
 
     if (d_volatilities) {
-        cudaFree(d_volatilities);
+        CUDA_RT_CALL(cudaFree(d_volatilities));
     }
-#endif
 
     if (d_exposures) {
-        cudaFree(d_exposures);
+        CUDA_RT_CALL(cudaFree(d_exposures));
+    }
+
+    if (simulated_rates) {
+        CUDA_RT_CALL(cudaFree(simulated_rates));
+    }
+
+    if (simulated_rates0) {
+        CUDA_RT_CALL(cudaFree(simulated_rates0));
     }
 }
 
