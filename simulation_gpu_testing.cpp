@@ -115,9 +115,7 @@ int main(int argc, char** argv)
 {
     int simN = 1000; // (argc == 0) ? 1 : atoi(argv[1]);
 
-    testSimulationCPU(simN);
+    //testSimulationCPU(simN);
 
-    printf("Number of Simulations %d", simN);
-
-    //testSimulationGPU(simN);
+    testSimulationGPU(simN);
 }

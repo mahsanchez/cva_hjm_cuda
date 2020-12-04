@@ -117,6 +117,31 @@ float musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0, f
     return result;
 }
 
+/*
+ * Initialize auxiliary vectors used during the simulation
+ */
+__global__
+void initVectors_kernel(float2* numeraires, float* simulated_rates, float* spot_rates, int exposuresCount, float dt) {
+    int gindex = blockIdx.x* blockDim.x + threadIdx.x;
+    int stride = TIMEPOINTS * gridDim.x;
+    int N = TIMEPOINTS * exposuresCount;
+
+    if ( (threadIdx.x < TIMEPOINTS) && (gindex < N) ) {
+        float rate = spot_rates[threadIdx.x];
+        float discount_factor = exp(-rate * dt);
+
+        for (int i = gindex; i < N; i += stride) {
+            // store the spot_rate
+            simulated_rates[i] = rate;
+            // initialize numeraire at t = 0
+            if (threadIdx.x == 0) {
+                numeraires[i].x = rate;
+                numeraires[i].y = discount_factor;
+            }
+        }
+    }
+}
+
 
 /**
 * * RNG init Kernel
@@ -127,10 +152,11 @@ void initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
 {
     const float mean = 0.0;  const float stddev = 1.0;
     curandGenerator_t generator;
-    CURAND_CALL( curandCreateGenerator(&generator, CURAND_RNG_QUASI_SOBOL32) );
-    CURAND_CALL( curandSetPseudoRandomGeneratorSeed(generator, seed) );
+    CURAND_CALL( curandCreateGenerator(&generator, CURAND_RNG_PSEUDO_DEFAULT) );
+    CURAND_CALL( curandSetPseudoRandomGeneratorSeed(generator, 1234ULL) );
     CURAND_CALL( curandGenerateNormal(generator, rngNrmVar, rnd_count, mean, stddev) );
     CUDA_RT_CALL( cudaDeviceSynchronize() );
+    CURAND_CALL(curandDestroyGenerator(generator));
 }
 #else
 __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsigned int seed, int rnd_count)
@@ -148,7 +174,7 @@ __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsi
  * Monte Carlo HJM Path Generation
 */
 __global__
-void __generatePaths_kernel2(float2* numeraires, int timepoints,
+void __generatePaths_kernel(float2* numeraires, int timepoints,
     float* drifts, float* volatilities, float* rngNrmVar,
     float* simulated_rates, float* simulated_rates0, float* accum_rates,
     const int pathN, int path, int nx, int ny, 
@@ -334,10 +360,11 @@ void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
 void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount) {
 
     //int _simN = 32000; // 1000; // 1000; // 1000; // 256; // 100; 1024
-    exposureCount = 1;
+   // exposureCount = 1;
 
-    // HJM Model number of paths
-    int pathN = 2500;
+    // HJM Model simulation number of paths with timestep dt = 0.01, dtau = 0.5 for 25 years
+    const int pathN = 2500;
+    const float dt = 0.01;
 
     // Memory allocation 
     float* d_accrual = 0;
@@ -348,6 +375,7 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     float* d_exposures = 0;
     float* simulated_rates = 0;
     float* simulated_rates0 = 0;
+    float* accum_rates = 0;
     
     // Select the GPU Device in a multigpu setup
     int gpu = 0;
@@ -358,6 +386,9 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     CUDA_RT_CALL(cudaMalloc((void**)&d_exposures, exposureCount * TIMEPOINTS * sizeof(float)));   // Exposure profiles
     CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates, exposureCount * TIMEPOINTS * sizeof(float)));
     CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates0, exposureCount * TIMEPOINTS * sizeof(float)));
+    CUDA_RT_CALL(cudaMalloc((void**)&accum_rates, exposureCount * TIMEPOINTS * sizeof(float)));
+    CUDA_RT_CALL(cudaMemset(accum_rates, 0, exposureCount * TIMEPOINTS * sizeof(float)));
+    CUDA_RT_CALL(cudaMemset(simulated_rates0, 0, exposureCount * TIMEPOINTS * sizeof(float)));
 
     // Global memory reservation for constant input data
     CUDA_RT_CALL(cudaMalloc((void**)&d_accrual, TIMEPOINTS * sizeof(float)));  // accrual
@@ -394,17 +425,40 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
 #endif
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "time taken to generate " << elapsed_time_ms << "(ms) normal random floats" << std::endl;
+    std::cout << "total random normal variates " << rngCount << " generated in " << elapsed_time_ms << "(ms)" << std::endl;
+
+    // Obtain number of SM per GPU device
+    cudaDeviceProp devprop;
+    cudaGetDeviceProperties(&devprop, gpu);
+    int sM = devprop.multiProcessorCount;
+
+    // Initialize vectors already stored in Global Memory
+    // simulated_rates values are initialized to the initial spot_rate values
+    int blockSize = 64;
+    int gridSize = (exposureCount < sM) ? exposureCount : (exposureCount - sM + 1) / sM; // <- Grid Size exposureCount < 40 (Total number of SM RTX 2070)
+
+    t_start = std::chrono::high_resolution_clock::now();
+    initVectors_kernel<<< gridSize, blockSize >>>(d_numeraire, simulated_rates, d_spot_rates, exposureCount, dt);
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+    t_end = std::chrono::high_resolution_clock::now();
+    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total time to initialize data " << elapsed_time_ms << "(ms)" << std::endl;
+
+#ifndef HJM_NUMERAIRE_DEBUG
+    for (int s = 0; s < exposureCount; s++) {
+        for (int t = 0; t < TIMEPOINTS; t++) {
+            printf(" %f", simulated_rates[s * TIMEPOINTS + t]);
+        }
+    }
+    std::cout << std::endl;
+#endif
 
     // Monte Carlo Simulation kernel execution configuration 
-    int exposureCount = 0;
-    dim3 dimBlock(64, 1, 1);
-    dim3 dimGrid(exposureCount, 1); // <- Grid Size exposureCount < 40 (Total number of SM RTX 2070)
-
     // Monte Carlos Simulation HJM Kernels (2500 paths)//dt = 0.01, dtau = 0.5
+    /*
     for (int path = 1; path < pathN; path++)
     {
-        __generatePaths_kernel <<<gridSize, blockSize >>> (
+        __generatePaths_kernel <<< exposureCount, blockSize >>> (
             numeraires,
             drift,
             volatilities,
@@ -420,6 +474,7 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
         // update simulated rates (swap pointers)
         std::swap(simulated_rates, simulated_rates0);
     }
+    */
 
     // Exposure Profile Calculation 
     // gpuReduceExposure_kernel <<<dimGrid, dimBlock>>>(d_exposures, d_numeraire, payOff.notional, payOff.K, d_accrual, _simN);
@@ -469,6 +524,10 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
 
     if (simulated_rates0) {
         CUDA_RT_CALL(cudaFree(simulated_rates0));
+    }
+
+    if (accum_rates) {
+        CUDA_RT_CALL(cudaFree(accum_rates));
     }
 }
 
