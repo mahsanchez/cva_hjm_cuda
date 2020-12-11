@@ -8,7 +8,7 @@
 
 #undef DEBUG_HJM_SIM
 #undef DEBUG_NUMERAIRE
-#define DEBUG_EXPOSURE
+#undef DEBUG_EXPOSURE
 #define DEBUG_EXPECTED_EXPOSURE
 
 struct __float2 {
@@ -245,7 +245,7 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
 
     // Auxiliary vectors
     float* d_x = 0;;
-    float* d_y = 0;
+    float* d_y = 0; 
     d_x = (float*) malloc(simN * sizeof(float));
     d_y = (float*) malloc(_TIMEPOINTS * sizeof(float));
 

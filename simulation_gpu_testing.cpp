@@ -87,11 +87,9 @@ std::vector<float> fixed_schedule = {
 };
 
 
-void testSimulationCPU(int simN) {
+void testSimulationCPU(int simN, InterestRateSwap& payOff) {
 
     float* exposure_curve = (float*)malloc(51 * sizeof(float));
-
-    InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.0470000, expiry, dtau);
 
     calculateExposureCPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], simN);
 
@@ -99,23 +97,23 @@ void testSimulationCPU(int simN) {
 }
 
 
-void testSimulationGPU(int simN) {
+void testSimulationGPU(int simN, InterestRateSwap &payOff) {
 
     float* exposure_curve = (float*) malloc(51 * sizeof(float));
-    
-    InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.025, expiry, dtau);
 
     calculateExposureGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, simN);
 
     free(exposure_curve);
 }
 
-// TODO - Pass the number of exposure simulations 
+
 int main(int argc, char** argv)
 {
     int simN = 1000; // (argc == 0) ? 1 : atoi(argv[1]);
 
-    //testSimulationCPU(simN);
+    InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.0470000, expiry, dtau);
 
-    testSimulationGPU(simN);
+    //testSimulationCPU(simN, payOff);
+
+    testSimulationGPU(simN, payOff);
 }

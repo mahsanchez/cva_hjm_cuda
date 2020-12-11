@@ -25,6 +25,7 @@
 
 #undef HJM_SDE_DEBUG
 #define MC_RDM_DEBUG
+#define HJM_PATH_SIMULATION_DEBUG1
 #define HJM_NUMERAIRE_DEBUG
 #define EXPOSURE_PROFILES_DEBUG
 #define DEV_CURND_HOSTGEN
@@ -82,6 +83,7 @@ float __musiela_sde2(float drift, float vol0, float vol1, float vol2, float phi0
  Calculate dF term in Musiela Parametrization SDE
 */
 
+/*
 __device__
 inline float __dFau(int t, int timepoints, float* rates) {
     float result = 0.0;
@@ -95,27 +97,8 @@ inline float __dFau(int t, int timepoints, float* rates) {
 
     return result;
 }
+*/
 
-
-__device__
-float musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0, float phi1, float phi2, float sqrt_dt, float dF, float rate0, float dtau, float dt) {
-
-    float v0 = (vol0 * phi0) * sqrt_dt;
-    float v1 = (vol1 * phi1) * sqrt_dt;
-    float v2 = (vol2 * phi2) * sqrt_dt;
-
-    float dfbar = drift * dt;
-    dfbar += v0;
-    dfbar += v1;
-    dfbar += v2;
-
-    dfbar += (dF / dtau) * dt;
-
-    // apply Euler Maruyana
-    float result = rate0 + dfbar;
-
-    return result;
-}
 
 /*
  * Initialize auxiliary vectors used during the simulation
@@ -169,41 +152,43 @@ __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsi
 }
 #endif
 
-
 /*
  * Monte Carlo HJM Path Generation
 */
 __global__
-void __generatePaths_kernel(float2* numeraires, int timepoints,
+void __generatePaths_kernel(float2* numeraires, 
     float* drifts, float* volatilities, float* rngNrmVar,
     float* simulated_rates, float* simulated_rates0, float* accum_rates,
-    const int pathN, int path, int nx, int ny, 
+    const int pathN, int path,  
     float dtau = 0.5, float dt = 0.01)
 {
     // calculated rate
     float rate;
+    float sum_rate;
 
     // Simulation Parameters
     int stride = dtau / dt; // 
     const float sqrt_dt = sqrtf(dt);
 
+    int t = threadIdx.x;
+    int gindex = blockIdx.x * TIMEPOINTS + threadIdx.x;
+    int rndIdx = blockIdx.x * pathN * VOL_DIM + path * VOL_DIM;
+
     // Normal variates
-    float phi0 = rngNrmVar[path * 3];
-    float phi1 = rngNrmVar[path * 3 + 1];
-    float phi2 = rngNrmVar[path * 3 + 2];
+    float phi0 = rngNrmVar[rndIdx]; 
+    float phi1 = rngNrmVar[rndIdx + 1]; 
+    float phi2 = rngNrmVar[rndIdx + 2]; 
 
-    const int t = threadIdx.x;
-    const int iy = blockIdx.y * blockDim.y + threadIdx.y;
-    const int ix = blockIdx.x * blockDim.x + threadIdx.x;
-    const int bindex = iy * nx;
-    const int gindex = bindex + ix;
-
-    // int globaltid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Evolve the whole curve from 0 to T 
+    // Evolve the whole curve from 0 to T ( 1:1 mapping t with threadIdx.x)
     if (t < TIMEPOINTS)
     {
-        float dF = __dFau(t, TIMEPOINTS, &simulated_rates[bindex]);
+        float dF = 0;
+        if (t == (TIMEPOINTS - 1)) {
+            dF = simulated_rates[gindex] - simulated_rates[gindex - 1];
+        }
+        else {
+            dF = simulated_rates[gindex + 1] - simulated_rates[gindex];
+        }
 
         rate = __musiela_sde2(
             drifts[t],
@@ -220,22 +205,28 @@ void __generatePaths_kernel(float2* numeraires, int timepoints,
             dt
         );
 
+#ifdef HJM_PATH_SIMULATION_DEBUG
+        printf("Path %d Block %d Thread %d index %d Forward Rate %f phi0 %f phi1 %f phi2 %f \n", path, blockIdx.x, threadIdx.x, gindex, rate, phi0, phi1, phi2);
+#endif
         // accumulate rate for discount calculation
-        accum_rates[gindex] += rate;
+        sum_rate = accum_rates[gindex];
+        sum_rate += rate;
+        accum_rates[gindex] = sum_rate;
 
         // store the simulated rate
-        simulated_rates0[gindex] = rate;
-    }
+        simulated_rates0[gindex] = rate; //
 
-    // update numeraire based on simulation block 
-    if (path % stride == 0) {
-        if (t < TIMEPOINTS) {
-            int lindex = path / stride;
-            numeraires[lindex].x = simulated_rates0[bindex + lindex];
-            numeraires[lindex].y = exp(-accum_rates[bindex + lindex] * dt);
+        // update numeraire based on simulation block 
+        if (path % stride == 0) {
+            if (t == (path / stride)) {
+                numeraires[gindex].x = rate;
+                numeraires[gindex].y = __expf(-sum_rate * dt);
+#ifdef HJM_NUMERAIRE_DEBUG
+                printf("Path %d Block %d Thread %d index %d Forward Rate %f Discount %f\n", path, blockIdx.x, threadIdx.x, gindex, rate, __expf(-sum_rate * dt));
+#endif
+            }
         }
     }
-
 }
 
 
@@ -243,45 +234,52 @@ void __generatePaths_kernel(float2* numeraires, int timepoints,
 /*
  * Exposure generation kernel
  * one to one mapping between threadIdx.x and tenor
+ * TODO - Multiply cashflow vector times triangular matrix to obtain the time to market and from there the expected exposure
  */
 __global__
-void gpuReduceExposure_kernel(float* exposure, float2* numeraires, const float notional, const float K, float* accrual, int simN)
+void _exposure_calc_kernel(float* exposure, float2* numeraires, const float notional, const float K, float* accrual, int simN)
 {
     __shared__ float cash_flows[TIMEPOINTS];
     float discount_factor;
     float forward_rate;
+    float cash_flow;
     float sum = 0.0;
 
-    int globaltid = blockIdx.x * blockDim.x + threadIdx.x;
+    int globaltid = blockIdx.x * TIMEPOINTS + threadIdx.x;
 
-    for (; globaltid < simN * TIMEPOINTS; globaltid += blockDim.x * TIMEPOINTS)
-    {
     // calculate and load the cash flow in shared memory
-        if (threadIdx.x < TIMEPOINTS) {
-            forward_rate = numeraires[globaltid].x;
-            discount_factor = numeraires[globaltid].y;          
-            cash_flows[threadIdx.x] = discount_factor * notional * accrual[threadIdx.x] * (forward_rate - K);
+    if (threadIdx.x < TIMEPOINTS) {
+        forward_rate = numeraires[globaltid].x;
+        discount_factor = numeraires[globaltid].y;   
+        cash_flow = discount_factor * notional * accrual[threadIdx.x] * (forward_rate - K);
+        cash_flows[threadIdx.x] = cash_flow;
+#ifdef EXPOSURE_PROFILES_DEBUG
+        printf("Block %d Thread %d Forward Rate %f Discount %f CashFlow %f \n", blockIdx.x, threadIdx.x, forward_rate, discount_factor, cash_flow);
+#endif
+    }
+    __syncthreads();
+
+#ifdef EXPOSURE_PROFILES_DEBUG
+    if (threadIdx.x == 0) {
+        for (int t = 0; t < TIMEPOINTS; t++) {
+            printf("t - index %d CashFlow %f \n", t, cash_flows[t]);
         }
-        __syncthreads();
+    }
+#endif
 
-        // calculate the exposure profile
-        if ( threadIdx.x <= (TIMEPOINTS - 1) )
-        {
-            #pragma unroll
-            for (int t = threadIdx.x + 1; t < TIMEPOINTS; t++) {
-                sum += cash_flows[t];
-            }
-
-            sum = (sum > 0.0) ? sum : 0.0;
-        
-            exposure[globaltid] = sum;
-
-    #ifdef MC_RDM_DEBUG
-            printf("Block %d Thread %d Exposure %f \n", blockIdx.x, threadIdx.x, sum);
-    #endif
+    // calculate the exposure profile
+    if ( threadIdx.x < TIMEPOINTS )
+    {
+        for (int t = threadIdx.x + 1; t < TIMEPOINTS; t++) {
+            sum += cash_flows[t];
         }
-        __syncthreads();
-    }   
+        sum = (sum > 0.0) ? sum : 0.0;
+        exposure[globaltid] = sum;
+#ifdef EXPOSURE_PROFILES_DEBUG
+        printf("Block %d Thread %d Exposure %f \n", blockIdx.x, threadIdx.x, sum);
+#endif
+    }
+    __syncthreads();
 }
 
 
@@ -360,11 +358,11 @@ void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
 void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount) {
 
     //int _simN = 32000; // 1000; // 1000; // 1000; // 256; // 100; 1024
-   // exposureCount = 1;
+    exposureCount = 1;
 
     // HJM Model simulation number of paths with timestep dt = 0.01, dtau = 0.5 for 25 years
     const int pathN = 2500;
-    const float dt = 0.01;
+    const float dt = 0.01f;
 
     // Memory allocation 
     float* d_accrual = 0;
@@ -430,16 +428,18 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     // Obtain number of SM per GPU device
     cudaDeviceProp devprop;
     cudaGetDeviceProperties(&devprop, gpu);
-    int sM = devprop.multiProcessorCount;
+    //int sM = devprop.multiProcessorCount;
 
     // Initialize vectors already stored in Global Memory
     // simulated_rates values are initialized to the initial spot_rate values
     int blockSize = 64;
-    int gridSize = (exposureCount < sM) ? exposureCount : (exposureCount - sM + 1) / sM; // <- Grid Size exposureCount < 40 (Total number of SM RTX 2070)
+    int gridSize = exposureCount; // (exposureCount < sM) ? exposureCount : (exposureCount - sM + 1) / sM; // <- Grid Size exposureCount < 40 (Total number of SM RTX 2070)
 
     t_start = std::chrono::high_resolution_clock::now();
+
     initVectors_kernel<<< gridSize, blockSize >>>(d_numeraire, simulated_rates, d_spot_rates, exposureCount, dt);
     CUDA_RT_CALL(cudaDeviceSynchronize());
+
     t_end = std::chrono::high_resolution_clock::now();
     elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     std::cout << "total time to initialize data " << elapsed_time_ms << "(ms)" << std::endl;
@@ -455,17 +455,21 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
 
     // Monte Carlo Simulation kernel execution configuration 
     // Monte Carlos Simulation HJM Kernels (2500 paths)//dt = 0.01, dtau = 0.5
-    /*
+    blockSize = 64;
+    gridSize = exposureCount; // 
+
+    t_start = std::chrono::high_resolution_clock::now();
+
     for (int path = 1; path < pathN; path++)
     {
-        __generatePaths_kernel <<< exposureCount, blockSize >>> (
-            numeraires,
-            drift,
-            volatilities,
+        __generatePaths_kernel <<< gridSize, blockSize >>> (
+            d_numeraire,
+            d_drifts,
+            d_volatilities,
             rngNrmVar,
             simulated_rates,
             simulated_rates0,
-            accum_rates,
+            d_accrual,
             pathN,
             path
         );  
@@ -474,11 +478,25 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
         // update simulated rates (swap pointers)
         std::swap(simulated_rates, simulated_rates0);
     }
-    */
+
+    t_end = std::chrono::high_resolution_clock::now();
+    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total time taken to run all " << pathN * exposureCount << " HJM MC simulation " << elapsed_time_ms << "(ms)" << std::endl;
 
     // Exposure Profile Calculation 
-    // gpuReduceExposure_kernel <<<dimGrid, dimBlock>>>(d_exposures, d_numeraire, payOff.notional, payOff.K, d_accrual, _simN);
-    // cudaDeviceSynchronize();
+
+    blockSize = 64;
+    gridSize = exposureCount; // 
+
+    t_start = std::chrono::high_resolution_clock::now();
+
+    _exposure_calc_kernel <<<gridSize, blockSize>>>(d_exposures, d_numeraire, payOff.notional, payOff.K, d_accrual, exposureCount);
+    CUDA_RT_CALL( cudaDeviceSynchronize() );
+
+    t_end = std::chrono::high_resolution_clock::now();
+    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total time taken to run all " << exposureCount << " exposure profile calculation " << elapsed_time_ms << "(ms)" << std::endl;
+
     // printf("Exposure Calculation  Time %fms\n", milliseconds);
 
     // Expected Exposure Profile Calculation
