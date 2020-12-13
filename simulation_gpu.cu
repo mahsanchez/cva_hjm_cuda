@@ -25,11 +25,11 @@
 
 #undef HJM_SDE_DEBUG
 #define MC_RDM_DEBUG
-#define HJM_PATH_SIMULATION_DEBUG1
+#undef HJM_PATH_SIMULATION_DEBUG
 #define HJM_NUMERAIRE_DEBUG
-#define EXPOSURE_PROFILES_DEBUG
+#undef EXPOSURE_PROFILES_DEBUG
 #define DEV_CURND_HOSTGEN
-#define EXPOSURE_PROFILES_AGGR_DEBUG
+#undef EXPOSURE_PROFILES_AGGR_DEBUG
 #undef CONST_MEMORY
 #define RNG_HOST_API
 #undef RNG_DEV_API
@@ -53,6 +53,13 @@
                                                        \
     }  
 
+#define CUBLAS_CALL(x)                                 \
+   {                                                   \
+        if((x)!=CUBLAS_STATUS_SUCCESS)                 \
+          printf("ERROR: CUBLAS call at %s:%d\n",__FILE__,__LINE__);\
+                                                       \
+    } 
+
 
 /*
  * Musiela Parametrization SDE
@@ -61,8 +68,7 @@
  */
 
 __device__
-float __musiela_sde2(float drift, float vol0, float vol1, float vol2, float phi0, float phi1, float phi2, float sqrt_dt, float dF, float rate0, float dtau, float dt) {
-
+inline float __musiela_sde2(float drift, float vol0, float vol1, float vol2, float phi0, float phi1, float phi2, float sqrt_dt, float dF, float rate0, float dtau, float dt) {
     float vol_sum = vol0 * phi0;
     vol_sum += vol1 * phi1;
     vol_sum += vol2 * phi2;
@@ -222,7 +228,7 @@ void __generatePaths_kernel(float2* numeraires,
                 numeraires[gindex].x = rate;
                 numeraires[gindex].y = __expf(-sum_rate * dt);
 #ifdef HJM_NUMERAIRE_DEBUG
-                printf("Path %d Block %d Thread %d index %d Forward Rate %f Discount %f\n", path, blockIdx.x, threadIdx.x, gindex, rate, __expf(-sum_rate * dt));
+                //printf("Path %d Block %d Thread %d index %d Forward Rate %f Discount %f\n", path, blockIdx.x, threadIdx.x, gindex, rate, __expf(-sum_rate * dt));
 #endif
             }
         }
@@ -262,7 +268,7 @@ void _exposure_calc_kernel(float* exposure, float2* numeraires, const float noti
 #ifdef EXPOSURE_PROFILES_DEBUG
     if (threadIdx.x == 0) {
         for (int t = 0; t < TIMEPOINTS; t++) {
-            printf("t - index %d CashFlow %f \n", t, cash_flows[t]);
+            printf("t - indext %d CashFlow %f \n", t, cash_flows[t]);
         }
     }
 #endif
@@ -285,70 +291,28 @@ void _exposure_calc_kernel(float* exposure, float2* numeraires, const float noti
 
 
 /*
-* Aggregation 
+* Calculate Expected Exposure Profile
+* 2D Aggregation using cublas sgemv
 */
 
-void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
+void __expectedexposure_calc_kernel(float* expected_exposure, float* exposures, float *d_x, float *d_y, cublasHandle_t &handle, int exposureCount) {
 
-    // CUDA device exepected_exposure
-    float * d_x = 0;;
-    float* d_y = 0;
- 
-    checkCudaErrors( cudaMalloc((void**)&d_x, simN * sizeof(float)));
-    checkCudaErrors( cudaMalloc((void**)&d_y, TIMEPOINTS * sizeof(float)));
-    float* identitiy_vector = (float*)malloc(simN * sizeof(float));
-
-    for (int i = 0; i < simN; i++) {
-        identitiy_vector[i] = 1.0;
-    }
-
-    // TODO - Move the d_x identity vector to Constant Memory
-    checkCudaErrors( cudaMemcpy(d_x, identitiy_vector, simN * sizeof(float), cudaMemcpyHostToDevice) );
-
-    // Matrix Vector Multiplication to Reduce a Matrix by columns
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-    const float alpha = 1.f;
+    const float alpha = 1.f/(float) exposureCount;
     const float beta = 1.f;
-    float cols = (float)TIMEPOINTS;
-    float rows = (float)simN;
+    float cols = (float) TIMEPOINTS;
+    float rows = (float) exposureCount;
     
     // Apply matrix x identity vector (all 1) to do a column reduction by rows
-    cublasSgemv(handle, CUBLAS_OP_N, cols, rows,  &alpha, exposures, cols, d_x, 1, &beta, d_y, 1);
-    cudaDeviceSynchronize();
+    CUBLAS_CALL ( cublasSgemv(handle, CUBLAS_OP_N, cols, rows,  &alpha, exposures, cols, d_x, 1, &beta, d_y, 1) );
+    CUDA_RT_CALL( cudaDeviceSynchronize() );
+
+    CUDA_RT_CALL(cudaMemcpy(expected_exposure, d_y, TIMEPOINTS * sizeof(float), cudaMemcpyDeviceToHost));
 
 #ifdef DEV_CURND_HOSTGEN1 
     printf("Exposure 2D Matrix Aggregation by Cols  \n");
     printf("Matrix Cols (%d) Rows(%d) x Vector (%d) in elapsed time %f ms \n", TIMEPOINTS, simN, simN, elapsed_time);
     printf("Effective Bandwidth: %f GB/s \n", 2 * TIMEPOINTS * simN * 4 / elapsed_time / 1e6);
 #endif
-
-    checkCudaErrors( cudaMemcpy(h_expected_exposure, d_y, TIMEPOINTS * sizeof(float), cudaMemcpyDeviceToHost) );
-
-    // calculate average across all reduced columns
-    for (int t = 0; t < TIMEPOINTS; t++) {
-        h_expected_exposure[t] = h_expected_exposure[t] / simN;
-    }
-
-#ifdef EXPOSURE_PROFILES_AGGR_DEBUG
-    printf("Expected Exposure Profile\n");
-    for (int t = 0; t < TIMEPOINTS; t++) {
-        printf("%1.4f ", h_expected_exposure[t]);
-    }
-    printf("\n");
-#endif
-
-    if (d_x) {
-        cudaFree(d_x);
-    }
-
-    if (d_y) {
-        cudaFree(d_y);
-    }
-
-    if (handle) {
-       cublasDestroy(handle);
-    }
 }
 
 
@@ -358,7 +322,7 @@ void gpuSumReduceAvg(float* h_expected_exposure, float* exposures, int simN) {
 void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount) {
 
     //int _simN = 32000; // 1000; // 1000; // 1000; // 256; // 100; 1024
-    exposureCount = 1;
+    exposureCount = 5000;
 
     // HJM Model simulation number of paths with timestep dt = 0.01, dtau = 0.5 for 25 years
     const int pathN = 2500;
@@ -374,6 +338,9 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     float* simulated_rates = 0;
     float* simulated_rates0 = 0;
     float* accum_rates = 0;
+    float* d_x = 0;;
+    float* d_y = 0;
+
     
     // Select the GPU Device in a multigpu setup
     int gpu = 0;
@@ -393,6 +360,18 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     CUDA_RT_CALL(cudaMalloc((void**)&d_spot_rates, TIMEPOINTS * sizeof(float)));  // spot_rates
     CUDA_RT_CALL(cudaMalloc((void**)&d_drifts, TIMEPOINTS * sizeof(float)));  // drifts
     CUDA_RT_CALL(cudaMalloc((void**)&d_volatilities, VOL_DIM * TIMEPOINTS * sizeof(float)));  // volatilities
+
+    // EE calculation aux vectors Global Memory (Convert to Const Memory)
+    CUDA_RT_CALL(cudaMalloc((void**)&d_x, exposureCount * sizeof(float)));
+    CUDA_RT_CALL(cudaMalloc((void**)&d_y, TIMEPOINTS * sizeof(float)));
+
+    // Set Value for EE calculation aux vectors
+    cudaMemset(d_x, 1, exposureCount * sizeof(float));
+    cudaMemset(d_y, 0, TIMEPOINTS * sizeof(float));
+
+    // CUBLAS handler
+    cublasHandle_t handle;
+    CUBLAS_CALL (cublasCreate(&handle));
 
     // Copy the spot_rates, drift & volatilities to device global memory Constant Memory TODO
     CUDA_RT_CALL(cudaMemcpy(d_accrual, accrual, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
@@ -497,12 +476,37 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     std::cout << "total time taken to run all " << exposureCount << " exposure profile calculation " << elapsed_time_ms << "(ms)" << std::endl;
 
-    // printf("Exposure Calculation  Time %fms\n", milliseconds);
-
     // Expected Exposure Profile Calculation
-    // Reduce all exposures realizations and average them to obtain the Expected Exposures (2D reduction on expsure matrix)
-    // gpuSumReduceAvg(expected_exposure, d_exposures, _simN);
+    t_start = std::chrono::high_resolution_clock::now();
 
+    __expectedexposure_calc_kernel(expected_exposure, d_exposures, d_x, d_y, handle, exposureCount);
+
+    t_end = std::chrono::high_resolution_clock::now();
+    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total time taken to run" << exposureCount << " expected exposure profile " << elapsed_time_ms << "(ms)" << std::endl;
+
+    // TODO - improve measurement GFLOPS
+
+#ifdef EXPOSURE_PROFILES_AGGR_DEBUG
+    printf("Expected Exposure Profile\n");
+    for (int t = 0; t < TIMEPOINTS; t++) {
+        printf("%1.4f ", expected_exposure[t]);
+    }
+    printf("\n");
+#endif
+
+    // Release Resources
+    if (handle) {
+        CUBLAS_CALL( cublasDestroy(handle) );
+    }
+
+    if (d_x) {
+        CUDA_RT_CALL(cudaFree(d_x));
+    }
+
+    if (d_y) {
+        CUDA_RT_CALL( cudaFree(d_y));
+    }
 
     if (d_numeraire) {
         CUDA_RT_CALL( cudaFree(d_numeraire) );
