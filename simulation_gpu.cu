@@ -31,7 +31,7 @@
 #undef HJM_NUMERAIRE_DEBUG
 #undef EXPOSURE_PROFILES_DEBUG
 #define DEV_CURND_HOSTGEN
-#define EXPOSURE_PROFILES_AGGR_DEBUG
+#undef EXPOSURE_PROFILES_AGGR_DEBUG
 #define EXPECTED_EXPOSURE_DEBUG
 #define CONST_MEMORY
 #define RNG_HOST_API
@@ -71,6 +71,7 @@
     __constant__ float d_volatilities[VOL_DIM * TIMEPOINTS];
 #endif
 
+
 /*
  * Musiela Parametrization SDE
  * We simulate the SDE f(t+dt)=f(t) + dfbar  
@@ -94,26 +95,6 @@ inline float __musiela_sde2(float drift, float vol0, float vol1, float vol2, flo
 
     return result;
 }
-
-/*
- Calculate dF term in Musiela Parametrization SDE
-*/
-
-/*
-__device__
-inline float __dFau(int t, int timepoints, float* rates) {
-    float result = 0.0;
-
-    if (t == (timepoints - 1)) {
-        result = rates[t] - rates[t - 1];
-    }
-    else {
-        result = rates[t + 1] - rates[t];
-    }
-
-    return result;
-}
-*/
 
 
 /**
@@ -148,7 +129,8 @@ __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsi
 __global__
 void __generatePaths_kernel(float2* numeraires, 
     /*float* d_spot_rates,
-    float* d_drifts, float* d_volatilities, */float* rngNrmVar,
+    float* d_drifts, float* d_volatilities, */ 
+    void* rngNrmVar,
     float* simulated_rates, float* simulated_rates0, float* accum_rates,
     const int pathN, int path,  
     float dtau = 0.5, float dt = 0.01)
@@ -163,7 +145,16 @@ void __generatePaths_kernel(float2* numeraires,
 
     int t = threadIdx.x;
     int gindex = blockIdx.x * TIMEPOINTS + threadIdx.x;
-    int rndIdx = blockIdx.x * pathN * VOL_DIM + path * VOL_DIM;
+
+#ifdef RNG_HOST_API
+    float phi0;
+    float phi1;
+    float phi2;
+#else
+    __shared__ float phi0;
+    __shared__ float phi1;
+    __shared__ float phi2;
+#endif
 
     // Evolve the whole curve from 0 to T ( 1:1 mapping t with threadIdx.x)
     if (t < TIMEPOINTS)
@@ -172,6 +163,7 @@ void __generatePaths_kernel(float2* numeraires,
             rate = d_spot_rates[t];
         }
         else {
+            // Calculate dF term in Musiela Parametrization SDE
             float dF = 0;
             if (t == (TIMEPOINTS - 1)) {
                 dF = simulated_rates[gindex] - simulated_rates[gindex - 1];
@@ -180,11 +172,26 @@ void __generatePaths_kernel(float2* numeraires,
                 dF = simulated_rates[gindex + 1] - simulated_rates[gindex];
             }
 
-            // Normal variates
-            float phi0 = rngNrmVar[rndIdx];
-            float phi1 = rngNrmVar[rndIdx + 1];
-            float phi2 = rngNrmVar[rndIdx + 2];
+            // Normal random variates
+ #ifdef RNG_HOST_API
+            float *rngNrms = (float*)rngNrmVar;
+            int rndIdx = blockIdx.x * pathN * VOL_DIM + path * VOL_DIM;
+            phi0 = rngNrms[rndIdx];
+            phi1 = rngNrms[rndIdx + 1];
+            phi2 = rngNrms[rndIdx + 2];
+#else
+            if (threadIdx.x == 0) {
+                curandStateMRG32k3a *state = (curandStateMRG32k3a*) rngNrmVar;
+                curandStateMRG32k3a localState = state[blockIdx.x];
+                phi0 = curand_uniform(&localState);
+                phi1 = curand_uniform(&localState);
+                phi2 = curand_uniform(&localState);
+                state[blockIdx.x] = localState;
+            }
+            __syncthreads();         
+#endif
 
+            // simulate the sde
             rate = __musiela_sde2(
                 d_drifts[t],
                 d_volatilities[t],
@@ -307,11 +314,11 @@ void __expectedexposure_calc_kernel(float* expected_exposure, float* exposures, 
 */
 void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount) {
 
-    //int _simN = 32000; // 1000; // 1000; // 1000; // 256; // 100; 1024
-    exposureCount = 10;
+    //exposureCount = 5000; // change exposure count here for testing 5, 10, 1000, 5000, 10000, 20000, 50000
+    exposureCount = 5000;
 
-    // HJM Model simulation number of paths with timestep dt = 0.01, dtau = 0.5 for 25 years
-    const int pathN = 2500;
+    // HJM Model simulation number of paths with timestep dt = 0.01, expiry = 25 years
+    const int pathN = 2500;  // payOff.expiry/dt
 
     // Memory allocation 
 #ifndef CONST_MEMORY
@@ -393,20 +400,24 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     int rngCount = exposureCount * VOL_DIM * pathN;
     CUDA_RT_CALL(cudaMalloc((void**)&rngNrmVar, rngCount * sizeof(float)));
 #else
-    const int rngCount = VOL_DIM * exposureCount;
-    curandStateMRG32k3a* rngStates = 0;
-    CUDA_RT_CALL(cudaMalloc((void**)&rngStates, rngCount * sizeof(curandStateMRG32k3a)));
+    const int rngCount = exposureCount;
+    curandStateMRG32k3a* rngNrmVar = 0;
+    CUDA_RT_CALL(cudaMalloc((void**)&rngNrmVar, rngCount * sizeof(curandStateMRG32k3a)));
     CUDA_RT_CALL(cudaDeviceSynchronize());
 #endif
+
+    // kernel dimension variables
+    int blockSize;
+    int gridSize;
 
     // Random Number Generation 
     auto t_start = std::chrono::high_resolution_clock::now();
 #ifdef RNG_HOST_API
     initRNG2_kernel(rngNrmVar, 1234ULL, rngCount);
 #else
-    int blockSize = 1024;
-    int gridSize = (rngCount + blockSize - 1) / blockSize;;
-    initRNG2_kernel << <gridSize, blockSize >> > (rngStates, 1234ULL, rngCount);
+    blockSize = 32;
+    gridSize = (rngCount + blockSize - 1) / blockSize;;
+    initRNG2_kernel << <gridSize, blockSize >> > (rngNrmVar, 1234ULL, rngCount);
 #endif
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -419,8 +430,8 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
 
     // Monte Carlo Simulation kernel execution configuration 
     // Monte Carlos Simulation HJM Kernels (2500 paths)//dt = 0.01, dtau = 0.5
-    int blockSize = 64;
-    int gridSize = exposureCount; // (exposureCount < sM) ? exposureCount : (exposureCount - sM + 1) 
+    blockSize = 64;
+    gridSize = exposureCount; // (exposureCount < sM) ? exposureCount : (exposureCount - sM + 1) 
 
     t_start = std::chrono::high_resolution_clock::now();
 
@@ -518,13 +529,9 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
         CUDA_RT_CALL( cudaFree(d_numeraire) );
     }
   
-#ifdef RNG_HOST_API
-    CUDA_RT_CALL(cudaFree(rngNrmVar));
-#else
-    if (rngStates) {
-        CUDA_RT_CALL(cudaFree(rngStates));
+    if (rngNrmVar) {
+        CUDA_RT_CALL(cudaFree(rngNrmVar));
     }
-#endif
 
 #ifndef CONST_MEMORY
     if (d_accrual) {
