@@ -315,7 +315,7 @@ void __expectedexposure_calc_kernel(float* expected_exposure, float* exposures, 
 /*
    Exposure Calculation Kernel Invocation
 */
-void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount, float dt = 0.01) {
+void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount, float dt) {
 
     //exposureCount = 5000; // change exposure count here for testing 5, 10, 1000, 5000, 10000, 20000, 50000
     exposureCount = 5000;
@@ -447,7 +447,9 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
             simulated_rates0,
             accum_rates,
             pathN,
-            path
+            path,
+            payOff.dtau,
+            dt
         );  
         CUDA_RT_CALL(cudaDeviceSynchronize());
 

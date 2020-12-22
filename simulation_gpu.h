@@ -6,6 +6,6 @@
 /*
    Exposure Calculation Kernel Invocation
 */
-void calculateExposureGPU(float* exposures, InterestRateSwap payOff, float *accrual, float* spot_rates, float* drift, float* volatilities, int simN);
+void calculateExposureGPU(float* exposures, InterestRateSwap payOff, float *accrual, float* spot_rates, float* drift, float* volatilities, int simN, float dt);
 
 #endif

@@ -101,7 +101,9 @@ void testSimulationGPU(int simN, InterestRateSwap &payOff) {
 
     float* exposure_curve = (float*) malloc(51 * sizeof(float));
 
-    calculateExposureGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, simN);
+    float dt = 0.01;
+
+    calculateExposureGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, simN, dt);
 
     free(exposure_curve);
 }
