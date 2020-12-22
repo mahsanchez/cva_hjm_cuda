@@ -239,24 +239,27 @@ void __generatePaths_kernel(float2* numeraires,
  * one to one mapping between threadIdx.x and tenor
  */
 __global__
-void _exposure_calc_kernel(float* exposure, float2* numeraires, const float notional, const float K, /*float* d_accrual,*/ int simN)
+void _exposure_calc_kernel(float* exposure, float2* numeraires, const float notional, const float K, /*float* d_accrual,*/ int simN, float dtau = 0.5f)
 {
     __shared__ float cash_flows[TIMEPOINTS];
     float discount_factor;
     float forward_rate;
+    float libor;
     float cash_flow;
     float sum = 0.0;
+    float m = (1.0f / dtau);
 
     int globaltid = blockIdx.x * TIMEPOINTS + threadIdx.x;
 
     // calculate and load the cash flow in shared memory
     if (threadIdx.x < TIMEPOINTS) {
         forward_rate = numeraires[globaltid].x;
+        libor = m * (__expf(forward_rate/m) - 1.0f);
         discount_factor = numeraires[globaltid].y;   
-        cash_flow = discount_factor * notional * d_accrual[threadIdx.x] * (forward_rate - K);
+        cash_flow = discount_factor * notional * d_accrual[threadIdx.x] * (libor - K);
         cash_flows[threadIdx.x] = cash_flow;
 #ifdef EXPOSURE_PROFILES_DEBUG
-        printf("Block %d Thread %d Forward Rate %f Discount %f CashFlow %f \n", blockIdx.x, threadIdx.x, forward_rate, discount_factor, cash_flow);
+        printf("Block %d Thread %d Forward Rate %f libor %f Discount %f CashFlow %f \n", blockIdx.x, threadIdx.x, forward_rate, libor, discount_factor, cash_flow);
 #endif
     }
     __syncthreads();
@@ -312,13 +315,13 @@ void __expectedexposure_calc_kernel(float* expected_exposure, float* exposures, 
 /*
    Exposure Calculation Kernel Invocation
 */
-void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount) {
+void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount, float dt = 0.01) {
 
     //exposureCount = 5000; // change exposure count here for testing 5, 10, 1000, 5000, 10000, 20000, 50000
     exposureCount = 5000;
 
     // HJM Model simulation number of paths with timestep dt = 0.01, expiry = 25 years
-    const int pathN = 2500;  // payOff.expiry/dt
+    const int pathN = payOff.expiry / dt; // 2500
 
     // Memory allocation 
 #ifndef CONST_MEMORY

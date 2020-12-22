@@ -110,8 +110,8 @@ void testSimulationGPU(int simN, InterestRateSwap &payOff) {
 int main(int argc, char** argv)
 {
     int simN = 1000; // (argc == 0) ? 1 : atoi(argv[1]);
-
-    InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.0470000, expiry, dtau);
+                                                                                                //0.04700
+    InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.06700, expiry, dtau);
 
     //testSimulationCPU(simN, payOff);
 
