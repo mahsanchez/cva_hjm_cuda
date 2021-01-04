@@ -157,26 +157,22 @@ void __calculateExposure_kernel(float* exposure, __float2* numeraires, const flo
     float forward_rate;
     float sum = 0.0;
 
-    // For each Simulation
-    for (int s = 0; s < simN; s++) {
-
-        // Calculate the Cashflows across tenors
-        for (int t = 0; t < _TIMEPOINTS; t++) {
-            forward_rate = numeraires[t].x;
-            discount_factor = numeraires[t].y;
-            cash_flows[t] = discount_factor * notional * accrual[t] * (forward_rate - K);
-        }
-
-        // Compute the IRS Mark to Market
-        for (int t = 0; t <= _TIMEPOINTS; t++) {
-            sum = 0.0;
-            for (int i = t + 1; i < _TIMEPOINTS; i++) {
-                sum += cash_flows[i];
-            }
-            sum = (sum > 0.0) ? sum : 0.0;
-            exposure[t] = sum;
-        }     
+    // Calculate the Cashflows across tenors
+    for (int t = 0; t < _TIMEPOINTS; t++) {
+        forward_rate = numeraires[t].x;
+        discount_factor = numeraires[t].y;
+        cash_flows[t] = discount_factor * notional * accrual[t] * (forward_rate - K);
     }
+
+    // Compute the IRS Mark to Market
+    for (int t = 0; t <= _TIMEPOINTS; t++) {
+        sum = 0.0;
+        for (int i = t + 1; i < _TIMEPOINTS; i++) {
+            sum += cash_flows[i];
+        }
+        sum = (sum > 0.0) ? sum : 0.0;
+        exposure[t] = sum;
+    }   
 }
 
 
