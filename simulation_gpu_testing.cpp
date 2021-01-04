@@ -6,6 +6,9 @@
 #include "simulation_cpu.h"
 #include "simulation_gpu.h"
 
+#define CPU_SIMULATION
+#define GPU_SIMULATION1
+
 /*
  * Testing HJM model accelerated in GPU CUDA
  */
@@ -87,11 +90,13 @@ std::vector<float> fixed_schedule = {
 };
 
 
-void testSimulationCPU(int simN, InterestRateSwap& payOff) {
+void testSimulationCPU(int exposuresCount, InterestRateSwap& payOff) {
 
     float* exposure_curve = (float*)malloc(51 * sizeof(float));
 
-    calculateExposureCPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], simN);
+    float dt = 0.01;
+
+    calculateExposureCPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], exposuresCount, dt);
 
     free(exposure_curve);
 }
@@ -111,11 +116,16 @@ void testSimulationGPU(int simN, InterestRateSwap &payOff) {
 
 int main(int argc, char** argv)
 {
-    int simN = 1000; // (argc == 0) ? 1 : atoi(argv[1]);
+    int exposuresCount = 5000; // (argc == 0) ? 1 : atoi(argv[1]);
                                                                                                 //0.04700
     InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.06700, expiry, dtau);
 
-    //testSimulationCPU(simN, payOff);
+#ifdef CPU_SIMULATION
+    std::cout << "## cpu measurements" << std::endl;
+    testSimulationCPU(exposuresCount, payOff);
+#else
+    std::cout << "## Gpu measurements" << std::endl;
+    testSimulationGPU(exposuresCount, payOff);
+#endif 
 
-    testSimulationGPU(simN, payOff);
 }

@@ -1,6 +1,7 @@
 #include "simulation_cpu.h"
 
 #include <iostream>
+#include <chrono>
 #include "mkl.h"
 #include "mkl_vsl.h"
 
@@ -77,6 +78,7 @@ inline float dFau(int t, int timepoints, float* rates) {
 
 void __generatePaths_kernel(__float2* numeraires, int timepoints,
     float* drifts, float* volatilities, float* rngNrmVar, 
+    float* spot_rates, 
     float* simulated_rates, float* simulated_rates0, float* accum_rates,
     const int pathN, int path, 
     float dtau = 0.5, float dt = 0.01)
@@ -96,23 +98,28 @@ void __generatePaths_kernel(__float2* numeraires, int timepoints,
     // Evolve the whole curve from 0 to T 
     for (int t = 0; t < _TIMEPOINTS; t++) 
     {
-        float dF = dFau(t, _TIMEPOINTS, simulated_rates);
+        if (path == 0) {
+            rate = spot_rates[t];
+        }
+        else {
+            float dF = dFau(t, _TIMEPOINTS, simulated_rates);
 
-        rate = __musiela_sde(
-            drifts[t],
-            volatilities[t],
-            volatilities[_TIMEPOINTS + t],
-            volatilities[_TIMEPOINTS * 2 + t],
-            phi0,
-            phi1,
-            phi2,
-            sqrt_dt,
-            dF,
-            simulated_rates[t],
-            dtau,
-            dt
-        );
-
+            rate = __musiela_sde(
+                drifts[t],
+                volatilities[t],
+                volatilities[_TIMEPOINTS + t],
+                volatilities[_TIMEPOINTS * 2 + t],
+                phi0,
+                phi1,
+                phi2,
+                sqrt_dt,
+                dF,
+                simulated_rates[t],
+                dtau,
+                dt
+            );
+        }
+       
         // accumulate rate for discount calculation
         accum_rates[t] += rate;
 
@@ -205,97 +212,79 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
 
 }
 
-/*
- * Initialize auxiliary vectors used during the simulation
- */
-void __initVectors_kernel(__float2* numeraires, float* simulated_rates, float* simulated_rates0, float* accum_rates, float *spot_rates, float dt) {
-
-    // Initialize simulated_rates with the spot_rate values
-    for (int t = 0; t < _TIMEPOINTS; t++) {
-        simulated_rates[t] = spot_rates[t];
-    }
-
-    // reset internal buffers
-    for (int t = 0; t < _TIMEPOINTS; t++) {
-        simulated_rates0[t] = 0.0;
-    }
-
-    // reset accumulators
-    for (int t = 0; t < _TIMEPOINTS; t++) {
-        accum_rates[t] = 0.0;
-    }
-
-    // initialize numeraires
-    numeraires[0].x = simulated_rates[0];
-    numeraires[0].y = exp(-simulated_rates[0] * dt);
-}
-
 
 /*
  * Exposure Calculation Kernel Invocation
 */
-void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int _simN) //dt, dtau
+void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int exposuresCount, float dt) //dt, dtau
 {
     //
-    int simN = 100;
-    int exposuresCount = simN;
-
-    //
-    float dt = 0.01;
 
     // Auxiliary vectors
     float* d_x = 0;;
     float* d_y = 0; 
-    d_x = (float*) malloc(simN * sizeof(float));
+    d_x = (float*) malloc(exposuresCount * sizeof(float));
     d_y = (float*) malloc(_TIMEPOINTS * sizeof(float));
 
     // Allocate numeraires (forward_rate, discount_factor)
     __float2* numeraires = 0;
-    numeraires = (__float2*) malloc(_TIMEPOINTS * simN * sizeof(__float2));
+    numeraires = (__float2*) malloc(_TIMEPOINTS * exposuresCount * sizeof(__float2));
 
     float* exposures = 0;
-    exposures = (float*) malloc(_TIMEPOINTS * simN * sizeof(float));
+    exposures = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));
 
     float* _expected_exposure = 0;
     _expected_exposure = (float*) malloc(_TIMEPOINTS * sizeof(float));
 
     // Simulated forward Curve
-    float* simulated_rates = (float*) malloc(_TIMEPOINTS * simN * sizeof(float));;
-    float* simulated_rates0 = (float*) malloc(_TIMEPOINTS * simN * sizeof(float));;
-    float* accum_rates = (float*) malloc(_TIMEPOINTS * simN * sizeof(float));;
+    float* simulated_rates = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));;
+    float* simulated_rates0 = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));;
+    float* accum_rates = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));;
 
     // initialize auxiliary vectors
-    for (int i = 0; i < simN; i++) {
+    for (int i = 0; i < exposuresCount; i++) {
         d_x[i] = 1.0;
     }
 
+    // reset accumulators
+    for (int t = 0; t < _TIMEPOINTS * exposuresCount; t++) {
+        accum_rates[t] = 0.0;
+    }
+
     // Iterate across all simulations
-    int pathN = 2501; // HJM Model simulation total paths number
-    int rnd_count = simN * pathN * 3; //
+    int pathN = payOff.expiry / dt; // HJM Model simulation total paths number  
+
+    // Number of Rnd normal variates 
+    int rnd_count = exposuresCount * pathN * 3; //
 
     // Generate the normal distributed variates
     float* rngNrmVar = 0;
     rngNrmVar = (float*) malloc(rnd_count * sizeof(float));
 
-    // normal distributed variates generation
-    __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
-    
-    //  initialize vectors data
-    for (int s = 0; s < exposuresCount; s++)
-    {
-        __initVectors_kernel(&numeraires[s * _TIMEPOINTS], &simulated_rates[s * _TIMEPOINTS], &simulated_rates0[s * _TIMEPOINTS], &accum_rates[s * _TIMEPOINTS], spot_rates, dt);
-    }
+    // Normal distributed variates generation
+    auto t_start = std::chrono::high_resolution_clock::now();
 
+    __initRNG2_kernel(rngNrmVar, 1234L, rnd_count);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total random normal variates " << rnd_count << " generated in " << elapsed_time_ms << "(ms)" << std::endl;
+    
     // Monte Carlos Simulation HJM Kernels (2500 paths)
-    for (int path = 1; path < pathN ; path++) 
+    
+    t_start = std::chrono::high_resolution_clock::now();
+
+    for (int path = 0; path < pathN ; path++) 
     {
-            for (int s = 0; s < exposuresCount; s++) {
+            for (int s = 0; s < exposuresCount; s++) 
+            {
                 __generatePaths_kernel(
                      &numeraires[s*_TIMEPOINTS], 
                     _TIMEPOINTS, 
                     drift, 
                     volatilities, 
                     &rngNrmVar[s*pathN*3], 
+                    spot_rates,
                     &simulated_rates[s*_TIMEPOINTS], 
                     &simulated_rates0[s*_TIMEPOINTS],
                     &accum_rates[s*_TIMEPOINTS], 
@@ -307,13 +296,31 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
             std::swap(simulated_rates, simulated_rates0);
     }
 
+    t_end = std::chrono::high_resolution_clock::now();
+    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total time taken to run all " << pathN * exposuresCount << " HJM MC simulation " << elapsed_time_ms << "(ms)" << std::endl;
+
     // Exposure Calculation
+
+    t_start = std::chrono::high_resolution_clock::now();
+
     for (int s = 0; s < exposuresCount; s++) {
-        __calculateExposure_kernel(&exposures[s * _TIMEPOINTS], &numeraires[s * _TIMEPOINTS], payOff.notional, payOff.K, accrual, simN);
+        __calculateExposure_kernel(&exposures[s * _TIMEPOINTS], &numeraires[s * _TIMEPOINTS], payOff.notional, payOff.K, accrual, exposuresCount);
     }
 
+    t_end = std::chrono::high_resolution_clock::now();
+    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total time taken to run all " << exposuresCount << " exposure profile calculation " << elapsed_time_ms << "(ms)" << std::endl;
+
     // Calculate the Expected Exposure Profile (EE[t])
-    __calculateExpectedExposure_kernel(_expected_exposure, exposures, d_x, d_y, simN);
+
+    t_start = std::chrono::high_resolution_clock::now();
+
+    __calculateExpectedExposure_kernel(_expected_exposure, exposures, d_x, d_y, exposuresCount);
+
+    t_end = std::chrono::high_resolution_clock::now();
+    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "total time taken to run" << exposuresCount << " expected exposure profile " << elapsed_time_ms << "(ms)" << std::endl;
 
 #ifdef DEBUG_NUMERAIRE
     printf("Forward Rates/ Discount Factors \n");
