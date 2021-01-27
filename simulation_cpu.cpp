@@ -2,15 +2,19 @@
 
 #include <iostream>
 #include <chrono>
+#include <curand.h>
+
 #include "mkl.h"
 #include "mkl_vsl.h"
 
 #define _TIMEPOINTS 51
 
+#define INTEL_MKL1
 #undef DEBUG_HJM_SIM
 #undef DEBUG_NUMERAIRE
 #undef DEBUG_EXPOSURE
 #define DEBUG_EXPECTED_EXPOSURE
+
 
 struct __float2 {
     float x;
@@ -44,14 +48,22 @@ float __musiela_sde(float drift, float vol0, float vol1, float vol2, float phi0,
  * Random Number generation
  */
 
-void __initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
+void __initRNG2_kernel(float* rngNrmVar, const unsigned long long seed, int rnd_count)
 {
+#ifdef INTEL_MKL
    VSLStreamStatePtr stream;
    //vslNewStream(&stream, VSL_BRNG_MT19937, 777);
    //vslNewStream(&stream, VSL_BRNG_MRG32K3A, 777);
-   vslNewStream(&stream, VSL_BRNG_SOBOL, 777);
+   vslNewStream(&stream, VSL_BRNG_SOBOL, 777); 
    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, rnd_count, rngNrmVar, 0.0, 1.0);
    vslDeleteStream(&stream);
+#else
+   curandGenerator_t generator;
+   curandCreateGeneratorHost(&generator, CURAND_RNG_PSEUDO_DEFAULT);
+   curandSetPseudoRandomGeneratorSeed(generator, seed);
+   curandGenerateNormal(generator, rngNrmVar, rnd_count, 0.0, 1.0);
+   curandDestroyGenerator(generator);
+#endif
 }
 
 /*
@@ -194,10 +206,6 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
     const float alpha = 1.f/simN;
     const float beta = 0.0;
 
-    for (int t = 0; t < _TIMEPOINTS; t++) {
-        d_y[t] = 0.0;
-    }
-
     cblas_sgemv(CblasRowMajor, CblasTrans, m, n, alpha, exposures, n, d_x, incx, beta, d_y, incy);
 
     printf("cblas_call\n");
@@ -237,9 +245,13 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     float* simulated_rates0 = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));;
     float* accum_rates = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));;
 
-    // initialize auxiliary vectors
+    // TODO -replace initialization with memset initialize auxiliary vectors
     for (int i = 0; i < exposuresCount; i++) {
         d_x[i] = 1.0;
+    }
+
+    for (int i = 0; i < _TIMEPOINTS; i++) {
+        d_y[i] = 0.0;
     }
 
     // reset accumulators

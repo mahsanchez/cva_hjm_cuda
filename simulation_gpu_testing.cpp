@@ -6,8 +6,8 @@
 #include "simulation_cpu.h"
 #include "simulation_gpu.h"
 
-#define CPU_SIMULATION
-#define GPU_SIMULATION1
+#define CPU_SIMULATION1
+#define GPU_SIMULATION
 
 /*
  * Testing HJM model accelerated in GPU CUDA
@@ -116,16 +116,18 @@ void testSimulationGPU(int simN, InterestRateSwap &payOff) {
 
 int main(int argc, char** argv)
 {
-    int exposuresCount = 5000; // (argc == 0) ? 1 : atoi(argv[1]);
+    int scenarios = 50000; // (argc == 0) ? 1 : atoi(argv[1]);
                                                                                                 //0.04700
     InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.06700, expiry, dtau);
 
+    std::cout << "## simulated scenarios " << scenarios << std::endl;
+
 #ifdef CPU_SIMULATION
     std::cout << "## cpu measurements" << std::endl;
-    testSimulationCPU(exposuresCount, payOff);
+    testSimulationCPU(scenarios, payOff);
 #else
     std::cout << "## Gpu measurements" << std::endl;
-    testSimulationGPU(exposuresCount, payOff);
+    testSimulationGPU(scenarios, payOff);
 #endif 
 
 }
