@@ -140,11 +140,12 @@ void initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
     CURAND_CALL(curandDestroyGenerator(generator));
 }
 
-void initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count, const float mean, const float stddev)
+void initRNG2_kernel(float* rngNrmVar, const unsigned int seed, unsigned long long offset, int rnd_count, const float mean, const float stddev)
 {
     curandGenerator_t generator;
     CURAND_CALL(curandCreateGenerator(&generator, CURAND_RNG_PSEUDO_DEFAULT));
     CURAND_CALL(curandSetPseudoRandomGeneratorSeed(generator, seed));
+    CURAND_CALL(curandSetGeneratorOffset(generator, offset));
     CURAND_CALL(curandGenerateNormal(generator, rngNrmVar, rnd_count, mean, stddev));
     CUDA_RT_CALL(cudaDeviceSynchronize());
     CURAND_CALL(curandDestroyGenerator(generator));
@@ -843,8 +844,10 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
         cudaSetDevice(gpuDevice);
 
         // create Random Numbers (change seed by adding the gpuDevice)
+        unsigned long long offset = gpuDevice * rnd_count;
+
         TIMED_RT_CALL(
-            initRNG2_kernel(rngNrmVar[gpuDevice], seed, rnd_count, mean, stddev),  "normal variate generation"
+            initRNG2_kernel(rngNrmVar[gpuDevice], seed, offset, rnd_count, mean, stddev),  "normal variate generation"
         );
 
         // Read-only data is duplicated and accessed locally. The data is made available to all GPUs by prefetching.
