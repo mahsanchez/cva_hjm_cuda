@@ -7,7 +7,8 @@
 #include "simulation_gpu.h"
 
 #define CPU_SIMULATION1
-#define GPU_SIMULATION
+#define GPU_SIMULATION 1
+#define MULTI_GPU_SIMULATION
 
 /*
  * Testing HJM model accelerated in GPU CUDA
@@ -114,6 +115,18 @@ void testSimulationGPU(int simN, InterestRateSwap &payOff) {
 }
 
 
+void testSimulationMultiGPU(int simN, InterestRateSwap& payOff) {
+
+    float* exposure_curve = (float*) malloc(51 * sizeof(float));
+
+    float dt = 0.01;
+
+    calculateExposureMultiGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, simN, dt);
+
+    free(exposure_curve);
+}
+
+
 int main(int argc, char** argv)
 {
     int scenarios = 50000; // (argc == 0) ? 1 : atoi(argv[1]);
@@ -125,9 +138,12 @@ int main(int argc, char** argv)
 #ifdef CPU_SIMULATION
     std::cout << "## cpu measurements" << std::endl;
     testSimulationCPU(scenarios, payOff);
-#else
+#elif GPU_SIMULATION == 1
     std::cout << "## Gpu measurements" << std::endl;
     testSimulationGPU(scenarios, payOff);
+#else 
+     std::cout << "## Multi Gpu measurements" << std::endl;
+     testSimulationMultiGPU(scenarios, payOff);
 #endif 
 
 }

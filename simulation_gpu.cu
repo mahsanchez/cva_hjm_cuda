@@ -10,6 +10,8 @@
 #include <helper_functions.h>
 #include <helper_cuda.h>
 
+#include <omp.h>
+#include <thread>
 #include <thrust\device_vector.h>
 
 #include <iostream>
@@ -36,6 +38,8 @@
 #define CONST_MEMORY
 #define RNG_HOST_API
 #undef RNG_DEV_API
+#define UM_HINTS
+#define TIME_COUNTERS
 
 #define CUDA_RT_CALL(call)                                                                  \
     {                                                                                       \
@@ -47,6 +51,17 @@
                     "%s (%d).\n",                                                           \
                     #call, __LINE__, __FILE__, cudaGetErrorString(cudaStatus), cudaStatus); \
     }
+
+
+#define TIMED_RT_CALL(x, y) \
+{ \
+    {auto t_start = std::chrono::high_resolution_clock::now(); \
+    x; \
+    auto t_end = std::chrono::high_resolution_clock::now(); \
+    double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count(); \
+    printf("%s %f (ms) \n", y , elapsed_time_ms); }\
+  \
+} 
 
 
 #define CURAND_CALL(x)                                 \
@@ -112,6 +127,16 @@ void initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count)
     CUDA_RT_CALL( cudaDeviceSynchronize() );
     CURAND_CALL(curandDestroyGenerator(generator));
 }
+
+void initRNG2_kernel(float* rngNrmVar, const unsigned int seed, int rnd_count, const float mean, const float stddev)
+{
+    curandGenerator_t generator;
+    CURAND_CALL(curandCreateGenerator(&generator, CURAND_RNG_PSEUDO_DEFAULT));
+    CURAND_CALL(curandSetPseudoRandomGeneratorSeed(generator, seed));
+    CURAND_CALL(curandGenerateNormal(generator, rngNrmVar, rnd_count, mean, stddev));
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+    CURAND_CALL(curandDestroyGenerator(generator));
+}
 #else
 __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsigned int seed, int rnd_count)
 {
@@ -122,6 +147,9 @@ __global__ void initRNG2_kernel(curandStateMRG32k3a* const rngStates, const unsi
     }
 }
 #endif
+
+
+
 
 /*
  * Monte Carlo HJM Path Generation
@@ -233,6 +261,43 @@ void __generatePaths_kernel(float2* numeraires,
 }
 
 
+/*
+* Risk Factor Generation 
+*/
+
+void riskFactorSim(
+    int gridSize, int blockSize, 
+    float2* numeraires,
+    void* rngNrmVar,
+    float* simulated_rates, 
+    float* simulated_rates0, 
+    float* accum_rates,
+    const int pathN, 
+    float dtau = 0.5, 
+    float dt = 0.01)
+{
+
+    for (int path = 0; path < pathN; path++)
+    {
+        __generatePaths_kernel <<< gridSize, blockSize >>> (
+            numeraires,
+            rngNrmVar,
+            simulated_rates,
+            simulated_rates0,
+            accum_rates,
+            pathN,
+            path,
+            dtau,
+            dt
+            );
+
+        CUDA_RT_CALL(cudaDeviceSynchronize());
+
+        // update simulated rates (swap pointers)
+        std::swap(simulated_rates, simulated_rates0);
+    }
+}
+
 
 /*
  * Exposure generation kernel
@@ -318,7 +383,6 @@ void __expectedexposure_calc_kernel(float* expected_exposure, float* exposures, 
 void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount, float dt) {
 
     //exposureCount = 5000; // change exposure count here for testing 5, 10, 1000, 5000, 10000, 20000, 50000
-    exposureCount = 5000;
 
     // HJM Model simulation number of paths with timestep dt = 0.01, expiry = 25 years
     const int pathN = payOff.expiry / dt; // 2500
@@ -431,8 +495,8 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     cudaGetDeviceProperties(&devprop, gpu);
     //int sM = devprop.multiProcessorCount;
 
-    // Monte Carlo Simulation kernel execution configuration 
-    // Monte Carlos Simulation HJM Kernels (2500 paths)//dt = 0.01, dtau = 0.5
+    // Risk Factor Generation by using Monte Carlo Simulation (HJM Framework / Musiela SDE)
+    // Monte Carlos Simulation HJM Grid (2500 paths)//dt = 0.01, dtau = 0.5, expiry = 25
     blockSize = 64;
     gridSize = exposureCount; // (exposureCount < sM) ? exposureCount : (exposureCount - sM + 1) 
 
@@ -480,8 +544,6 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
     float* exposures = (float*)malloc(exposureCount * TIMEPOINTS * sizeof(float));
 
     CUDA_RT_CALL(cudaMemcpy(exposures, d_exposures, exposureCount * TIMEPOINTS * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // thrust::copy(Y.begin(), Y.end(), std::ostream_iterator<int>(std::cout, "\n"));
 
     printf("Exposure Profile\n");
     for (int s = 0; s < exposureCount; s++) {
@@ -575,3 +637,109 @@ void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, flo
 
 
 
+
+/*
+   Exposure Calculation Kernel Invocation
+*/
+void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int scenarios, float dt) {
+
+    const int num_gpus = 4;
+    //cudaGetDeviceCount(&num_gpus);
+
+    float* rngNrmVar[num_gpus];
+    const int pathN = payOff.expiry / dt; // 25Y requires 2500 simulations
+    int rnd_count = scenarios/num_gpus * VOL_DIM * pathN;
+    const unsigned int seed = 1234ULL;
+    const float mean = 0.0;
+    const float stddev = 1.0;
+
+    // TODO store all this calibrated data in a single vector
+    float* _accrual = 0; // cudaMallocManaged
+    float* _spot_rates = 0; // cudaMallocManaged
+    float* _drifts = 0; // cudaMallocManaged
+    float* _volatilities = 0; // cudaMallocManaged
+
+    float2* d_numeraire[num_gpus];
+    float* d_exposures[num_gpus];
+    float* simulated_rates[num_gpus];
+    float* simulated_rates0[num_gpus];
+    float* accum_rates[num_gpus];
+    float* d_x = 0;
+    float* d_y = 0;
+    float* ee_result[num_gpus];
+
+    cublasHandle_t handle;
+
+    // HJM Simulation Kernel Execution Parameters
+    int blockSize = 64;
+    int gridSize = scenarios / num_gpus;
+
+    // Read-only data is duplicated and accessed locally. The data is made available to all GPUs by prefetching.
+    #ifdef UM_HINTS
+        CUDA_RT_CALL( cudaMemAdvise(_accrual, TIMEPOINTS, cudaMemAdviseSetReadMostly, 0));
+        CUDA_RT_CALL( cudaMemAdvise(_spot_rates, TIMEPOINTS, cudaMemAdviseSetReadMostly, 0));
+        CUDA_RT_CALL( cudaMemAdvise(_drifts, TIMEPOINTS, cudaMemAdviseSetReadMostly, 0));
+        CUDA_RT_CALL( cudaMemAdvise(_volatilities, VOL_DIM * TIMEPOINTS, cudaMemAdviseSetReadMostly, 0));
+    #endif 
+
+    omp_set_num_threads(num_gpus);
+    #pragma omp parallel
+    {
+        int gpuDevice = omp_get_thread_num();
+
+        // printf("1: %d Thread# %d: x = %d\n", omp_get_num_threads(), omp_get_thread_num(), 2);
+        cudaSetDevice(gpuDevice);
+
+        // initialize memory to store the random numbers across gpus
+        CUDA_RT_CALL(cudaMalloc((void**)&rngNrmVar[gpuDevice], rnd_count * sizeof(float)));
+
+        // create Random Numbers (change seed by adding the gpuDevice)
+        TIMED_RT_CALL(
+            initRNG2_kernel(rngNrmVar[gpuDevice], seed, rnd_count, mean, stddev),
+            "normal variate generation"
+        );
+
+        // Prefetching here causes read duplication of data instead of data migration
+        CUDA_RT_CALL(cudaMemPrefetchAsync(_accrual, TIMEPOINTS, gpuDevice));
+        CUDA_RT_CALL(cudaMemPrefetchAsync(_spot_rates, TIMEPOINTS, gpuDevice));
+        CUDA_RT_CALL(cudaMemPrefetchAsync(_drifts, TIMEPOINTS, gpuDevice));
+        CUDA_RT_CALL(cudaMemPrefetchAsync(_volatilities, VOL_DIM * TIMEPOINTS, gpuDevice));
+
+        // Risk Factor Simulations  
+        TIMED_RT_CALL( 
+            riskFactorSim(
+                blockSize,
+                gridSize,
+                d_numeraire[gpuDevice],
+                rngNrmVar[gpuDevice],
+                simulated_rates[gpuDevice],
+                simulated_rates0[gpuDevice],
+                accum_rates[gpuDevice],
+                pathN,
+                payOff.dtau,
+                dt
+            ),
+            "Total Execution Time HJM MC simulation"
+        );
+
+        // Exposure Profile Calculation  TODO (d_exposures + gpuDevice * TIMEPOINTS)
+        _exposure_calc_kernel <<< gridSize, blockSize >>> (d_exposures[gpuDevice], d_numeraire[gpuDevice], payOff.notional, payOff.K, scenarios / num_gpus);
+
+        // Partial Expected Exposure Calculation and scattered across gpus
+        CUBLAS_CALL(cublasCreate(&handle));
+        __expectedexposure_calc_kernel(ee_result[gpuDevice], d_exposures[gpuDevice], d_x, d_y, handle, scenarios / num_gpus);
+
+        // free up resources
+        if (rngNrmVar[gpuDevice]) {
+            CUDA_RT_CALL( cudaFree(rngNrmVar[gpuDevice]) );
+        }
+
+        if (handle) {
+            CUBLAS_CALL(cublasDestroy(handle));
+        }
+    }
+
+    // collect results and aggregate them all to obtain the final expected_exposure
+    // gather_expected_exposure();   multiply the unique vector times 1/scenarios
+    // calculate the cva value
+}
