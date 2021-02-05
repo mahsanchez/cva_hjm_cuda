@@ -2,13 +2,18 @@
 #include <vector>
 #include <iterator>
 #include <algorithm>
+#include <stdlib.h>
+#include <cmath>
+#include <cstdio>
+#include <iostream>
+#include <sstream>
 
 #include "simulation_cpu.h"
 #include "simulation_gpu.h"
 
 #define CPU_SIMULATION1
-#define GPU_SIMULATION 1
-#define MULTI_GPU_SIMULATION
+#define GPU_SIMULATION 
+#define EXPECTED_EXPOSURE_DEBUG 
 
 /*
  * Testing HJM model accelerated in GPU CUDA
@@ -91,59 +96,82 @@ std::vector<float> fixed_schedule = {
 };
 
 
-void testSimulationCPU(int exposuresCount, InterestRateSwap& payOff) {
+template <typename T>
+T get_argval(char** begin, char** end, const std::string& arg, const T default_val) {
+    T argval = default_val;
+    char** itr = std::find(begin, end, arg);
+    if (itr != end && ++itr != end) {
+        std::istringstream inbuf(*itr);
+        inbuf >> argval;
+    }
+    return argval;
+}
 
-    float* exposure_curve = (float*)malloc(51 * sizeof(float));
+bool get_arg(char** begin, char** end, const std::string& arg) {
+    char** itr = std::find(begin, end, arg);
+    if (itr != end) {
+        return true;
+    }
+    return false;
+}
 
-    float dt = 0.01;
+
+
+void testSimulationCPU(float* exposure_curve, int exposuresCount, InterestRateSwap& payOff, const float dt) {
 
     calculateExposureCPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], exposuresCount, dt);
-
-    free(exposure_curve);
 }
 
 
-void testSimulationGPU(int simN, InterestRateSwap &payOff) {
+void testSimulationMultiGPU(float* exposure_curve, const int num_gpus, int scenarios, InterestRateSwap& payOff, const float dt) {
 
-    float* exposure_curve = (float*) malloc(51 * sizeof(float));
-
-    float dt = 0.01;
-
-    calculateExposureGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, simN, dt);
-
-    free(exposure_curve);
+    calculateExposureMultiGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, num_gpus, scenarios, dt);
 }
 
-
-void testSimulationMultiGPU(int simN, InterestRateSwap& payOff) {
-
-    float* exposure_curve = (float*) malloc(51 * sizeof(float));
-
-    float dt = 0.01;
-
-    calculateExposureMultiGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, simN, dt);
-
-    free(exposure_curve);
-}
+/* TODO Today and measure throughput simulations/seconds */
 
 
 int main(int argc, char** argv)
 {
-    int scenarios = 50000; // (argc == 0) ? 1 : atoi(argv[1]);
-                                                                                                //0.04700
+    int num_gpus = 0;            
+    const int timepoints = 51;
     InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.06700, expiry, dtau);
 
-    std::cout << "## simulated scenarios " << scenarios << std::endl;
+    std::cout << "valid arguments [-cpu|-single_gpu|-multigpu] -scenarios [number] -dt [0.01 - 0.001]" << std::endl << std::endl;
 
-#ifdef CPU_SIMULATION
-    std::cout << "## cpu measurements" << std::endl;
-    testSimulationCPU(scenarios, payOff);
-#elif GPU_SIMULATION == 1
-    std::cout << "## Gpu measurements" << std::endl;
-    testSimulationGPU(scenarios, payOff);
-#else 
-     std::cout << "## Multi Gpu measurements" << std::endl;
-     testSimulationMultiGPU(scenarios, payOff);
-#endif 
+    const bool cpu = get_arg(argv, argv + argc, "-cpu");
+    if (!cpu) {
+        const bool multi_gpu = get_arg(argv, argv + argc, "-multi_gpu");
+        num_gpus = (multi_gpu) ? 4 : 1;
+    }
 
+    int scenarios = get_argval(argv, argv + argc, "-scenarios", 100000); 
+    float dt = get_argval(argv, argv + argc, "-dt", 0.01);
+
+    std::cout << "## scenarios " << scenarios << " simulations per scenarios" << payOff.expiry/dt << std::endl;
+
+    float* expected_exposure = (float*)malloc(51 * sizeof(float));
+
+    if (num_gpus == 0)  {
+        std::cout << "## cpu measurements" << std::endl;
+        testSimulationCPU(expected_exposure, scenarios, payOff, dt);
+    }
+    else {
+        std::cout << "## Gpu measurements for num_gpus: " << num_gpus << std::endl;
+        testSimulationMultiGPU(expected_exposure, num_gpus, scenarios, payOff, dt);
+    }
+
+#ifdef EXPECTED_EXPOSURE_DEBUG
+    printf("Expected Exposure Profile\n");
+    for (int t = 0; t < timepoints; t++) {
+        printf("%1.6f ", expected_exposure[t]);
+    }
+    printf("\n");
+#endif
+
+    if (expected_exposure) {
+        free(expected_exposure);
+    }
+
+    exit(0);
 }

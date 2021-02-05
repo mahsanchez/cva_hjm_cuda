@@ -220,7 +220,7 @@ void __calculateExpectedExposure_kernel(float* expected_exposure, float* exposur
 /*
  * Exposure Calculation Kernel Invocation
 */
-void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int exposuresCount, float dt) //dt, dtau
+void calculateExposureCPU(float* _expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drift, float* volatilities, int exposuresCount, float dt) //dt, dtau
 {
     //
 
@@ -237,8 +237,8 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     float* exposures = 0;
     exposures = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));
 
-    float* _expected_exposure = 0;
-    _expected_exposure = (float*) malloc(_TIMEPOINTS * sizeof(float));
+    //float* _expected_exposure = 0;
+   // _expected_exposure = (float*) malloc(_TIMEPOINTS * sizeof(float));
 
     // Simulated forward Curve
     float* simulated_rates = (float*) malloc(_TIMEPOINTS * exposuresCount * sizeof(float));;
@@ -349,14 +349,6 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
     }
 #endif
 
-#ifdef DEBUG_EXPECTED_EXPOSURE
-    printf("Expected Exposures \n");
-    for (int t = 0; t < _TIMEPOINTS; t++)
-    {
-        printf("%f ", _expected_exposure[t]);
-    }
-#endif
-
     // free resources
     if (d_x) {
      // free(d_x);
@@ -390,7 +382,7 @@ void calculateExposureCPU(float* expected_exposure, InterestRateSwap payOff, flo
       //free(exposures);
     }
 
-    if (_expected_exposure) {
+    //if (_expected_exposure) {
       //free(_expected_exposure);
-    }
+    //}
 }

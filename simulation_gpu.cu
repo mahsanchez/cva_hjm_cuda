@@ -17,6 +17,12 @@
 
 #include <iostream>
 
+using std::cout; using std::endl;
+using std::chrono::duration_cast;
+using std::chrono::milliseconds;
+using std::chrono::seconds;
+using std::chrono::system_clock;
+
 #include "simulation_gpu.h"
 
 #define FULL_MASK 0xffffffff
@@ -61,7 +67,8 @@
     x; \
     auto t_end = std::chrono::high_resolution_clock::now(); \
     double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count(); \
-    printf("%s %f (ms) \n", y , elapsed_time_ms); }\
+    auto millisec_since_epoch = std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count(); \
+    printf("%d %s %f (ms) \n", millisec_since_epoch, y , elapsed_time_ms); }\
   \
 } 
 
@@ -377,6 +384,15 @@ void _exposure_calc_kernel(float* exposure, float2* numeraires, const float noti
 }
 
 
+/*
+*  Exposure calculation
+*/
+
+void exposureCalculation(int gridSize, int blockSize, float *d_exposures, float2 *d_numeraire, float notional, float K, int scenarios) {
+    _exposure_calc_kernel <<< gridSize, blockSize >>> (d_exposures, d_numeraire, notional, K, scenarios);
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+}
+
 
 /*
 * Calculate Expected Exposure Profile
@@ -401,280 +417,16 @@ void __expectedexposure_calc_kernel(float* expected_exposure, float* exposures, 
 }
 
 
-/*
-   Exposure Calculation Kernel Invocation
-*/
-void calculateExposureGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int exposureCount, float dt) {
-
-    //exposureCount = 5000; // change exposure count here for testing 5, 10, 1000, 5000, 10000, 20000, 50000
-
-    // HJM Model simulation number of paths with timestep dt = 0.01, expiry = 25 years
-    const int pathN = payOff.expiry / dt; // 2500
-
-    // Memory allocation 
-#ifndef CONST_MEMORY
-    float* d_accrual = 0;
-    float* d_spot_rates = 0;
-    float* d_drifts = 0;
-    float* d_volatilities = 0;
-#endif
-    float2* d_numeraire = 0;
-    float* d_exposures = 0;
-    float* simulated_rates = 0;
-    float* simulated_rates0 = 0;
-    float* accum_rates = 0;
-    float* d_x = 0;;
-    float* d_y = 0;
-
-    
-    // Select the GPU Device in a multigpu setup
-    int gpu = 0;
-    cudaSetDevice(gpu);
-
-    // Global memory reservation for constant input data
-    CUDA_RT_CALL(cudaMalloc((void**)&d_numeraire, exposureCount * TIMEPOINTS * sizeof(float2)));  // Numeraire (discount_factor, forward_rates)
-    CUDA_RT_CALL(cudaMalloc((void**)&d_exposures, exposureCount * TIMEPOINTS * sizeof(float)));   // Exposure profiles
-    CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates, exposureCount * TIMEPOINTS * sizeof(float)));
-    CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates0, exposureCount * TIMEPOINTS * sizeof(float)));
-    CUDA_RT_CALL(cudaMalloc((void**)&accum_rates, exposureCount * TIMEPOINTS * sizeof(float)));
-
-    // Global memory reservation for constant input data
-#ifndef CONST_MEMORY
-    CUDA_RT_CALL(cudaMalloc((void**)&d_accrual, TIMEPOINTS * sizeof(float)));  // accrual
-    CUDA_RT_CALL(cudaMalloc((void**)&d_spot_rates, TIMEPOINTS * sizeof(float)));  // spot_rates
-    CUDA_RT_CALL(cudaMalloc((void**)&d_drifts, TIMEPOINTS * sizeof(float)));  // drifts
-    CUDA_RT_CALL(cudaMalloc((void**)&d_volatilities, VOL_DIM * TIMEPOINTS * sizeof(float)));  // volatilities
-#endif
-
-    // EE calculation aux vectors Global Memory (Convert to Const Memory)
-    CUDA_RT_CALL(cudaMalloc((void**)&d_x, exposureCount * sizeof(float)));
-    CUDA_RT_CALL(cudaMalloc((void**)&d_y, TIMEPOINTS * sizeof(float)));
-
-    // initialize accum_rates float array
-    int N = exposureCount * TIMEPOINTS;
-    thrust::device_ptr<float> dev_ptr(accum_rates);
-    thrust::fill(dev_ptr, dev_ptr + N, (float) 0.0f);
-
-    // initialize simulated_rates0 float array
-    thrust::device_ptr<float> dev_ptr2(simulated_rates0);
-    thrust::fill(dev_ptr2, dev_ptr2 + N, (float)0.0f);
-
-    // initialize d_x float array
-    N = exposureCount;
-    thrust::device_ptr<float> dev_ptr3(d_x);
-    thrust::fill(dev_ptr3, dev_ptr3 + N, (float) 1.0f);
-
-    // initialize d_x float array
-    N = TIMEPOINTS;
-    thrust::device_ptr<float> dev_ptr4(d_y);
-    thrust::fill(dev_ptr4, dev_ptr4 + N, (float)0.0f);
-
-    // CUBLAS handler
-    cublasHandle_t handle;
-    CUBLAS_CALL (cublasCreate(&handle));
-
-#ifdef CONST_MEMORY
-    CUDA_RT_CALL(cudaMemcpyToSymbol(d_accrual, accrual, TIMEPOINTS * sizeof(float)));
-    CUDA_RT_CALL(cudaMemcpyToSymbol(d_spot_rates, spot_rates, TIMEPOINTS * sizeof(float)));
-    CUDA_RT_CALL(cudaMemcpyToSymbol(d_drifts, drifts, TIMEPOINTS * sizeof(float)));
-    CUDA_RT_CALL(cudaMemcpyToSymbol(d_volatilities, volatilities, VOL_DIM * TIMEPOINTS * sizeof(float)));
-#else
-    CUDA_RT_CALL(cudaMemcpy(d_accrual, accrual, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_RT_CALL(cudaMemcpy(d_spot_rates, spot_rates, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_RT_CALL(cudaMemcpy(d_drifts, drifts, TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_RT_CALL(cudaMemcpy(d_volatilities, volatilities, VOL_DIM * TIMEPOINTS * sizeof(float), cudaMemcpyHostToDevice));
-#endif
-
-    // Global Memory reservation for RNG vector
-#ifdef RNG_HOST_API
-    float* rngNrmVar = 0;
-    int rngCount = exposureCount * VOL_DIM * pathN;
-    CUDA_RT_CALL(cudaMalloc((void**)&rngNrmVar, rngCount * sizeof(float)));
-#else
-    const int rngCount = exposureCount;
-    curandStateMRG32k3a* rngNrmVar = 0;
-    CUDA_RT_CALL(cudaMalloc((void**)&rngNrmVar, rngCount * sizeof(curandStateMRG32k3a)));
-    CUDA_RT_CALL(cudaDeviceSynchronize());
-#endif
-
-    // kernel dimension variables
-    int blockSize;
-    int gridSize;
-
-    // Random Number Generation 
-    auto t_start = std::chrono::high_resolution_clock::now();
-#ifdef RNG_HOST_API
-    initRNG2_kernel(rngNrmVar, 1234ULL, rngCount);
-#else
-    blockSize = 32;
-    gridSize = (rngCount + blockSize - 1) / blockSize;;
-    initRNG2_kernel << <gridSize, blockSize >> > (rngNrmVar, 1234ULL, rngCount);
-#endif
-    auto t_end = std::chrono::high_resolution_clock::now();
-    double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "total random normal variates " << rngCount << " generated in " << elapsed_time_ms << "(ms)" << std::endl;
-
-    // Obtain number of SM per GPU device
-    cudaDeviceProp devprop;
-    cudaGetDeviceProperties(&devprop, gpu);
-    //int sM = devprop.multiProcessorCount;
-
-    // Risk Factor Generation by using Monte Carlo Simulation (HJM Framework / Musiela SDE)
-    // Monte Carlos Simulation HJM Grid (2500 paths)//dt = 0.01, dtau = 0.5, expiry = 25
-    blockSize = 64;
-    gridSize = exposureCount; // (exposureCount < sM) ? exposureCount : (exposureCount - sM + 1) 
-
-    t_start = std::chrono::high_resolution_clock::now();
-
-    for (int path = 0; path < pathN; path++)
-    {
-        __generatePaths_kernel <<< gridSize, blockSize >>> (
-            d_numeraire,
-            rngNrmVar,
-            simulated_rates,
-            simulated_rates0,
-            accum_rates,
-            pathN,
-            path,
-            payOff.dtau,
-            dt
-        );  
-        CUDA_RT_CALL(cudaDeviceSynchronize());
-
-        // update simulated rates (swap pointers)
-        std::swap(simulated_rates, simulated_rates0);
-    }
-
-    t_end = std::chrono::high_resolution_clock::now();
-    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "total time taken to run all " << pathN * exposureCount << " HJM MC simulation " << elapsed_time_ms << "(ms)" << std::endl;
-
-    // Exposure Profile Calculation 
-
-    blockSize = 64;
-    gridSize = exposureCount; // 
-
-    t_start = std::chrono::high_resolution_clock::now();
-
-    _exposure_calc_kernel <<<gridSize, blockSize>>>(d_exposures, d_numeraire, payOff.notional, payOff.K, /*d_accrual,*/ exposureCount);
-    CUDA_RT_CALL( cudaDeviceSynchronize() );
-
-    t_end = std::chrono::high_resolution_clock::now();
-    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "total time taken to run all " << exposureCount << " exposure profile calculation " << elapsed_time_ms << "(ms)" << std::endl;
-
-
-#ifdef EXPOSURE_PROFILES_AGGR_DEBUG
-    float* exposures = (float*)malloc(exposureCount * TIMEPOINTS * sizeof(float));
-
-    CUDA_RT_CALL(cudaMemcpy(exposures, d_exposures, exposureCount * TIMEPOINTS * sizeof(float), cudaMemcpyDeviceToHost));
-
-    printf("Exposure Profile\n");
-    for (int s = 0; s < exposureCount; s++) {
-        for (int t = 0; t < TIMEPOINTS; t++) {
-            printf("%1.4f ", exposures[s * TIMEPOINTS + t]);
-        }
-        printf("\n");
-    }
-    
-    free(exposures);
-#endif
-
-    // Expected Exposure Profile Calculation
-    t_start = std::chrono::high_resolution_clock::now();
-
-    float* result = (float* ) malloc( TIMEPOINTS * sizeof(float));
-    memset(expected_exposure, 0.0f, TIMEPOINTS * sizeof(float));
-
-    __expectedexposure_calc_kernel(result, d_exposures, d_x, d_y, handle, exposureCount);
-
-    float avg = 1.0f / (float)exposureCount;
-    cblas_saxpy(TIMEPOINTS, avg, result, 1, expected_exposure, 1);
-
-    t_end = std::chrono::high_resolution_clock::now();
-    elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "total time taken to run" << exposureCount << " expected exposure profile " << elapsed_time_ms << "(ms)" << std::endl;
-
-
-
-    // TODO - improve measurement GFLOPS
-
-#ifdef EXPECTED_EXPOSURE_DEBUG
-    printf("Expected Exposure Profile\n");
-    for (int t = 0; t < TIMEPOINTS; t++) {
-        printf("%1.4f ", expected_exposure[t]);
-    }
-    printf("\n");
-#endif
-
-    free(result);
-
-    // Release Resources
-    if (handle) {
-        CUBLAS_CALL( cublasDestroy(handle) );
-    }
-
-    if (d_x) {
-        CUDA_RT_CALL(cudaFree(d_x));
-    }
-
-    if (d_y) {
-        CUDA_RT_CALL( cudaFree(d_y));
-    }
-
-    if (d_numeraire) {
-        CUDA_RT_CALL( cudaFree(d_numeraire) );
-    }
-  
-    if (rngNrmVar) {
-        CUDA_RT_CALL(cudaFree(rngNrmVar));
-    }
-
-#ifndef CONST_MEMORY
-    if (d_accrual) {
-        CUDA_RT_CALL(cudaFree(d_accrual));
-    }
-
-    if (d_spot_rates) {
-        CUDA_RT_CALL(cudaFree(d_spot_rates));
-    }
-
-    if (d_drifts) {
-        CUDA_RT_CALL(cudaFree(d_drifts));
-    }
-
-    if (d_volatilities) {
-        CUDA_RT_CALL(cudaFree(d_volatilities));
-    }
-#endif
-
-    if (d_exposures) {
-        CUDA_RT_CALL(cudaFree(d_exposures));
-    }
-
-    if (simulated_rates) {
-        CUDA_RT_CALL(cudaFree(simulated_rates));
-    }
-
-    if (simulated_rates0) {
-        CUDA_RT_CALL(cudaFree(simulated_rates0));
-    }
-
-    if (accum_rates) {
-        CUDA_RT_CALL(cudaFree(accum_rates));
-    }
-}
 
 
 /*
    Exposure Calculation Kernel Invocation
 */
-void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, int scenarios, float dt) {
-
-    const int num_gpus = 4;
+void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff, float* accrual, float* spot_rates, float* drifts, float* volatilities, const int num_gpus, int scenarios, float dt) {
+   
     //cudaGetDeviceCount(&num_gpus);
 
-    float* rngNrmVar[num_gpus];
+    std::vector<float*> rngNrmVar(num_gpus);
     const int pathN = payOff.expiry / dt; // 25Y requires 2500 simulations
     int scenarios_gpus = scenarios / num_gpus; // total work distribution across gpus
     int rnd_count = scenarios_gpus * VOL_DIM * pathN;
@@ -684,14 +436,14 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
     const int curveSizeBytes = TIMEPOINTS * sizeof(float); // Total memory occupancy for 51 timepoints
 
     // intermediate & final results memory reservation on device data
-    float2* d_numeraire[num_gpus];
-    float* d_exposures[num_gpus];
-    float* simulated_rates[num_gpus];
-    float* simulated_rates0[num_gpus];
-    float* accum_rates[num_gpus];
-    float* d_x[num_gpus];
-    float* d_y[num_gpus];
-    float* partial_exposure[num_gpus];
+    std::vector<float2*> d_numeraire(num_gpus);
+    std::vector<float*> d_exposures(num_gpus);
+    std::vector<float*> simulated_rates(num_gpus);
+    std::vector<float*> simulated_rates0(num_gpus);
+    std::vector<float*> accum_rates(num_gpus);
+    std::vector<float*> d_x(num_gpus);
+    std::vector<float*> d_y(num_gpus);
+    std::vector<float*> partial_exposure(num_gpus);
 
     // memory allocation
     for (int gpuDevice = 0; gpuDevice < num_gpus; gpuDevice++) {
@@ -752,12 +504,15 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
                 payOff.dtau,
                 dt
             ),
-            "Total Execution Time HJM MC simulation"
+            "Execution Time Partial HJM MC simulation"
         );
 
         // Exposure Profile Calculation  TODO (d_exposures + gpuDevice * TIMEPOINTS)
-        _exposure_calc_kernel <<< gridSize, blockSize >>> (d_exposures[gpuDevice], d_numeraire[gpuDevice], payOff.notional, payOff.K, scenarios_gpus);
-        CUDA_RT_CALL(cudaDeviceSynchronize());
+        TIMED_RT_CALL(
+            exposureCalculation(gridSize, blockSize, d_exposures[gpuDevice], d_numeraire[gpuDevice], payOff.notional, payOff.K, scenarios_gpus),
+            "exposure calculation"
+        );
+
 
         // Partial Expected Exposure Calculation and scattered across gpus
         cublasHandle_t handle; CUBLAS_CALL(cublasCreate(&handle));
@@ -776,7 +531,7 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
     memset(expected_exposure, 0.0f, TIMEPOINTS * sizeof(float));
 
     for (int gpuDevice = 1; gpuDevice < num_gpus; gpuDevice++) {
-#ifdef EXPECTED_EXPOSURE_DEBUG
+#ifdef EXPECTED_EXPOSURE_DEBUG1
         printf("Expected Exposure Profile\n");
         for (int t = 0; t < TIMEPOINTS; t++) {
             printf("%1.4f ", partial_exposure[gpuDevice][t]);
@@ -788,15 +543,6 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
 
     float avg = 1.0f / (float) scenarios;
     cblas_saxpy(TIMEPOINTS, avg, partial_exposure[0], 1, expected_exposure, 1);
-
-
-#ifdef EXPECTED_EXPOSURE_DEBUG
-    printf("Expected Exposure Profile\n");
-    for (int t = 0; t < TIMEPOINTS; t++) {
-        printf("%1.4f ", expected_exposure[t]);
-    }
-    printf("\n");
-#endif
 
 
     // free up resources
