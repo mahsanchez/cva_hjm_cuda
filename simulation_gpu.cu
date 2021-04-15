@@ -112,6 +112,7 @@ struct MarketData {
  *  CUDA utility function
  */
 void cudaMemsetFloat(float *buffer, int N, float initial_value) {
+    //CUDA_RT_CALL( cudaMemset(buffer, 0, N * sizeof(float)) );
     thrust::device_ptr<float> dev_ptr(buffer);
     thrust::fill(dev_ptr, dev_ptr + N, initial_value);
 }
@@ -422,8 +423,157 @@ void __generatePaths_kernel(
         }
     }
 
+/**
+* Shared Memory & Global Access Memory optimizations & block simulation
+*/
+
+ __global__
+        void __generatePaths_kernel4(
+            int numberOfPoints,
+            float2* numeraires,
+            float* rngNrmVar,
+            float* simulated_rates,
+            float* simulated_rates0,
+            const int pathN, int path,
+            float dtau = 0.5, float dt = 0.01)
+    {
+        // calculated rate
+        float rate;
+        float sum_rate = 0;
+        float phi0;
+        float phi1;
+        float phi2;
+
+        extern __shared__ float _ssimulated_rates[BLOCK_SIZE];
+
+        // Simulation Parameters
+        int stride = dtau / dt; // 
+        const float sqrt_dt = sqrtf(dt);
+
+        int t = threadIdx.x % TIMEPOINTS;
+        int gindex = blockIdx.x * numberOfPoints + threadIdx.x;
+
+        if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints)) {
+            if ( path > 0) { 
+                _ssimulated_rates[threadIdx.x] = simulated_rates[gindex];
+            }
+        }
+        __syncthreads();
+       
+        //
+        for (int s = 0; s < stride; s++) 
+        {
+            if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints))
+            {
+                if (path == 0) {
+                    rate = d_spot_rates[t];
+                }
+                else {
+                    // Calculate dF term in Musiela Parametrization SDE
+                    float dF = 0;
+
+                    if (t == (TIMEPOINTS - 1)) {
+                        dF = _ssimulated_rates[threadIdx.x] - _ssimulated_rates[threadIdx.x - 1];
+                    }
+                    else {
+                        dF = _ssimulated_rates[threadIdx.x + 1] - _ssimulated_rates[threadIdx.x];
+                    }
+
+                    // Normal random variates broadcast if access same memory location in shared memory
+                    float* rngNrms = (float*)rngNrmVar;
+                    int rndIdx = blockIdx.x * pathN * VOL_DIM + (path + s)* VOL_DIM;
+                    phi0 = rngNrms[rndIdx];
+                    phi1 = rngNrms[rndIdx + 1];
+                    phi2 = rngNrms[rndIdx + 2];
+
+                    // simulate the sde
+                    rate = __musiela_sde2(
+                        d_drifts[t],
+                        d_volatilities[t],
+                        d_volatilities[TIMEPOINTS + t],
+                        d_volatilities[TIMEPOINTS * 2 + t],
+                        phi0,
+                        phi1,
+                        phi2,
+                        sqrt_dt,
+                        dF,
+                        _ssimulated_rates[threadIdx.x],
+                        dtau,
+                        dt
+                    );
+                }
+
+                // accumulate rate for discount calculation
+                sum_rate += rate;
+                
+            }
+
+            __syncthreads();
+
+            if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints))
+            {
+                _ssimulated_rates[threadIdx.x] = rate;
+            }
+
+            __syncthreads();
+
+        }
+
+        // update the rates for the next simulation block
+        if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints))
+        {
+            simulated_rates0[gindex] = rate;
+        }
+        
+        // update numeraire based on simulation block 
+        if ( t == (path + stride) / stride ) {
+            numeraires[gindex].x = rate;  // forward rate
+            numeraires[gindex].y = __expf(-sum_rate * dt); // discount factor
+        }
+    }
+
 /*
-* Risk Factor Generation 
+* Risk Factor Generation block simulation
+*/
+
+void riskFactorSim4(
+    int gridSize,
+    int blockSize,
+    int numberOfPoints,
+    float2* numeraires,
+    float* rngNrmVar,
+    float* simulated_rates,
+    float* simulated_rates0,
+    const int pathN,
+    float dtau = 0.5,
+    float dt = 0.01)
+{
+    int simBlockSize = dtau / dt;
+
+    for (int path = 0; path < pathN; path += simBlockSize)
+    {
+        __generatePaths_kernel4 <<< gridSize, blockSize >>> (
+            numberOfPoints,
+            numeraires,
+            rngNrmVar,
+            simulated_rates,
+            simulated_rates0,
+            pathN,
+            path,
+            dtau,
+            dt
+        );
+
+        CUDA_RT_CALL(cudaDeviceSynchronize());
+
+        // update simulated rates (swap pointers)
+        std::swap(simulated_rates, simulated_rates0);
+    }
+
+}
+
+/*
+* Risk Factor Generation naive acceleration
 */
 
 void riskFactorSim(
@@ -457,7 +607,7 @@ void riskFactorSim(
             dt
             );
 #else
-        __generatePaths_kernel << < gridSize, blockSize >> > (
+        __generatePaths_kernel <<< gridSize, blockSize >>> (
             numberOfPoints,
             numeraires,
             rngNrmVar,
@@ -581,7 +731,7 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
     int rnd_count = scenarios_gpus * VOL_DIM * pathN;
     const unsigned int seed = 1234ULL;
     const float mean = 0.0;
-    const float stddev = 1.0;
+    const float _stddev = 1.0;
     const int curveSizeBytes = TIMEPOINTS * sizeof(float); // Total memory occupancy for 51 timepoints
 
     // intermediate & final results memory reservation on device data
@@ -616,15 +766,21 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
         CUDA_RT_CALL(cudaMemcpyToSymbol(d_volatilities, volatilities, VOL_DIM * curveSizeBytes));
 
         // initialize array structures
-        cudaMemsetFloat(accum_rates[gpuDevice], scenarios_gpus * TIMEPOINTS, 0.0f);
-        cudaMemsetFloat(simulated_rates0[gpuDevice], scenarios_gpus * TIMEPOINTS, 0.0f);
+        CUDA_RT_CALL(cudaMemset(accum_rates[gpuDevice], 0, scenarios_gpus * TIMEPOINTS * sizeof(float)));
+        CUDA_RT_CALL(cudaMemset(simulated_rates0[gpuDevice], 0, scenarios_gpus * TIMEPOINTS * sizeof(float)));
+        CUDA_RT_CALL(cudaMemset(d_y[gpuDevice], 0, TIMEPOINTS * sizeof(float)));
+        //cudaMemsetFloat(accum_rates[gpuDevice], scenarios_gpus * TIMEPOINTS, 0.0f);
+        //cudaMemsetFloat(simulated_rates0[gpuDevice], scenarios_gpus * TIMEPOINTS, 0.0f);
+        //cudaMemsetFloat(d_y[gpuDevice], TIMEPOINTS, 0.0f);
         cudaMemsetFloat(d_x[gpuDevice], scenarios_gpus, 1.0f);
-        cudaMemsetFloat(d_y[gpuDevice], TIMEPOINTS, 0.0f);
+        
     }
 
+    //  
+    ///free(x);
+
     // random generation
-    omp_set_num_threads(num_gpus);
-    #pragma omp parallel 
+    #pragma omp parallel  num_threads(num_gpus)
     {
         int gpuDevice = omp_get_thread_num();
 
@@ -633,25 +789,41 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
         // create Random Numbers (change seed by adding the gpuDevice)
         unsigned long long offset = gpuDevice * rnd_count;
         TIMED_RT_CALL(
-            initRNG2_kernel(rngNrmVar[gpuDevice], seed, offset, rnd_count, mean, stddev), "normal variate generation"
+            initRNG2_kernel(rngNrmVar[gpuDevice], seed, offset, rnd_count, mean, _stddev), "normal variate generation"
         );
     }
 
     // risk factor evolution
-    omp_set_num_threads(num_gpus);
-    #pragma omp parallel 
+    #pragma omp parallel num_threads(num_gpus)
     {
         int gpuDevice = omp_get_thread_num();
 
         cudaSetDevice(gpuDevice);
 
         // Kernel Execution Parameters
-        int N = 2;
+        int N = 1;
         int blockSize = N* BLOCK_SIZE;
         int numberOfPoints = N * TIMEPOINTS;
         int gridSize = scenarios_gpus / N;
 
         // Run Risk Factor Simulations  
+        TIMED_RT_CALL(
+           riskFactorSim4(
+            gridSize,
+            blockSize,
+            numberOfPoints,
+            d_numeraire[gpuDevice],
+            rngNrmVar[gpuDevice],
+            simulated_rates[gpuDevice],
+            simulated_rates0[gpuDevice],
+            pathN,
+            payOff.dtau,
+            dt
+           ),
+            "Execution Time Partial HJM MC simulation"
+        );
+
+        /*
         TIMED_RT_CALL( 
             riskFactorSim(
                 gridSize,
@@ -668,6 +840,7 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
             ),
             "Execution Time Partial HJM MC simulation"
         );
+        */
 
         // Exposure Profile Calculation  TODO (d_exposures + gpuDevice * TIMEPOINTS)
         TIMED_RT_CALL(
@@ -735,11 +908,9 @@ void calculateExposureMultiGPU(float* expected_exposure, InterestRateSwap payOff
         if (accum_rates[gpuDevice]) {
             CUDA_RT_CALL(cudaFree(accum_rates[gpuDevice]));
         }
-
         if (d_x[gpuDevice]) {
             CUDA_RT_CALL(cudaFree(d_x[gpuDevice]));
         }
-
         if (d_y[gpuDevice]) {
             CUDA_RT_CALL(cudaFree(d_y[gpuDevice]));
         }
