@@ -532,6 +532,119 @@ void __generatePaths_kernel(
         }
     }
 
+/**
+  * Shared Memory & Global Access Memory optimizations & block simulation
+*/
+
+__global__
+            void __generatePaths_kernelSharedMemOnTFlyRandom(
+                int numberOfPoints,
+                float2* numeraires,
+                curandState* rngStates,
+                float* simulated_rates,
+                float* simulated_rates0,
+                const int pathN, int path,
+                float dtau = 0.5, float dt = 0.01)
+        {
+            // calculated rate
+            float rate;
+            float sum_rate = 0;
+
+            extern __shared__ float _ssimulated_rates[BLOCK_SIZE];
+            extern __shared__ float3 rngNrms[BLOCK_SIZE]; // random generated gaussians
+
+            // Simulation Parameters
+            int stride = dtau / dt; // 
+            const float sqrt_dt = sqrtf(dt);
+
+            int t = threadIdx.x % TIMEPOINTS;
+            int gindex = blockIdx.x * numberOfPoints + threadIdx.x;
+            int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+            // Create all the random gaussians and store them in the phi array
+            curandState state = rngStates[tid];
+            rngNrms[tid].x = curand_normal(&state);
+            rngNrms[tid].y = curand_normal(&state);
+            rngNrms[tid].z = curand_normal(&state);
+            __syncthreads();
+
+            // Initialize the initial forward rate curve for this simulation block
+            if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints)) {
+                if (path > 0) {
+                    _ssimulated_rates[threadIdx.x] = simulated_rates[gindex];
+                }
+            }
+            __syncthreads();
+
+            //
+            for (int s = 0; s < stride; s++)
+            {
+                if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints))
+                {
+                    if (path == 0) {
+                        rate = d_spot_rates[t];
+                    }
+                    else {
+                        // Calculate dF term in Musiela Parametrization SDE
+                        float dF = 0;
+
+                        if (t == (TIMEPOINTS - 1)) {
+                            dF = _ssimulated_rates[threadIdx.x] - _ssimulated_rates[threadIdx.x - 1];
+                        }
+                        else {
+                            dF = _ssimulated_rates[threadIdx.x + 1] - _ssimulated_rates[threadIdx.x];
+                        }
+
+                        // Normal random variates broadcast if access same memory location in shared memory
+                        int rndIdx = s * VOL_DIM;
+                        float3 phi = rngNrms[rndIdx];
+
+                        // simulate the sde
+                        rate = __musiela_sde2(
+                            d_drifts[t],
+                            d_volatilities[t],
+                            d_volatilities[TIMEPOINTS + t],
+                            d_volatilities[TIMEPOINTS * 2 + t],
+                            phi.x,
+                            phi.y,
+                            phi.z,
+                            sqrt_dt,
+                            dF,
+                            _ssimulated_rates[threadIdx.x],
+                            dtau,
+                            dt
+                        );
+                    }
+
+                    // accumulate rate for discount calculation
+                    sum_rate += rate;
+
+                }
+
+                __syncthreads();
+
+                if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints))
+                {
+                    _ssimulated_rates[threadIdx.x] = rate;
+                }
+
+                __syncthreads();
+
+            }
+
+            // update the rates for the next simulation block
+            if ((threadIdx.x < numberOfPoints) && (gindex < gridDim.x * numberOfPoints))
+            {
+                simulated_rates0[gindex] = rate;
+            }
+
+            // update numeraire based on simulation block 
+            if (t == (path + stride) / stride) {
+                numeraires[gindex].x = rate;  // forward rate
+                numeraires[gindex].y = __expf(-sum_rate * dt); // discount factor
+            }
+}
+
 /*
 * Risk Factor Generation block simulation
 */
