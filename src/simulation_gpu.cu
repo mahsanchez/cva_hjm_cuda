@@ -38,7 +38,7 @@ using std::chrono::system_clock;
 #define MAX_BLOCK_SZ 256
 #define BATCH_SZ 1000
 //#define double_ACC 1
-#define EXPECTED_EXPOSURE_DEBUG1 1
+//#define EXPECTED_EXPOSURE_DEBUG1 1
 
 #undef HJM_SDE_DEBUG
 #define MC_RDM_DEBUG
