@@ -15,16 +15,25 @@
 #define GPU_SIMULATION 
 #define EXPECTED_EXPOSURE_DEBUG 
 
+//#define SINGLE_PRECISION
 #define DOUBLE_PRECISION
 
 
+#ifdef DOUBLE_PRECISION
+typedef  double real;
+#else // SINGLEE_PRECISION
+typedef float real;
+#endif
+
+
+//typedef double real;
 
 /*
  * Testing HJM model accelerated in GPU CUDA
  */
 
  // First row is the last observed forward curve (BOE data)
-float spot_rates[51] = {
+real spot_rates[51] = {
     0.046138361,0.045251174,0.042915805,0.04283311,0.043497719,0.044053792,0.044439518,0.044708496,0.04490347,0.045056615,0.045184474,0.045294052,0.045386152,0.045458337,0.045507803,0.045534188,
     0.045541867,0.045534237,0.045513128,0.045477583,0.04542292,0.045344477,0.04523777,0.045097856,0.044925591,0.04472353,0.044494505,0.044242804,0.043973184,0.043690404,0.043399223,0.043104398,
     0.042810688,0.042522852,0.042244909,0.041978295,0.041723875,0.041482518,0.04125509,0.041042459,0.040845492,0.040665047,0.040501255,0.040353009,0.040219084,0.040098253,0.039989288,0.039890964,
@@ -35,7 +44,7 @@ float spot_rates[51] = {
 /*
  * HJM Calibration (volatilities, drift)
  */
-float volatilities[153] =
+real volatilities[153] =
 {
 0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,
 0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,0.006430655,
@@ -54,7 +63,7 @@ float volatilities[153] =
 };
 
 // Drift Callibration
-float drifts[51] = {
+real drifts[51] = {
 0.0000000,0.0000362,0.0000689,0.0000992,0.0001278,0.0001552,0.0001817,0.0002075,0.0002326,0.0002569,0.0002804,0.0003029,0.0003244,0.0003446,0.0003636,0.0003812,
 0.0003974,0.0004122,0.0004257,0.0004380,0.0004491,0.0004593,0.0004689,0.0004779,0.0004868,0.0004957,0.0005050,0.0005149,0.0005257,0.0005377,0.0005511,0.0005660,
 0.0005826,0.0006009,0.0006211,0.0006430,0.0006667,0.0006919,0.0007184,0.0007460,0.0007744,0.0008033,0.0008323,0.0008610,0.0008892,0.0009164,0.0009425,0.0009674,
@@ -96,7 +105,7 @@ double volatilities_d[153] =
 };
 
 //Year Count Fractiions 30/360
-std::vector<float> yearCountFractions = {
+std::vector<real> yearCountFractions = {
     0.04000, 0.00250, 0.25278,  0.2500642, 0.25556,  0.2513385, 0.25556,  0.25000,  0.25278,  0.25556,  0.25556,
     0.25556, 0.25556,  0.25278,  0.25278, 0.26111, 0.25278,  0.25278,  0.25278, 0.25278, 0.25278,
     0.25556, 0.25556,  0.25278,  0.25278, 0.26111, 0.25278,  0.25278,  0.25278, 0.25278, 0.25278, 
@@ -105,7 +114,7 @@ std::vector<float> yearCountFractions = {
 };
 
 //Year Count Fractiions 30/360
-std::vector<float> accrual = {
+std::vector<real> accrual = {
     0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556, 0.505556,
     0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556,
     0.505556, 0.511111, 0.502778, 0.511111, 0.502778, 0.511111, 0.502778,  0.516667, 0.505556, 0.505556,
@@ -135,16 +144,16 @@ std::vector<double> accrual_d = {
 /*
 * Interest Rate Swap Product Definition 5Y Floating, 5Y Fixing 3M reset
 */
-const float expiry = 25.0; // 25.0;
-const float dtau = 0.5;
+const real expiry = 25.0; // 25.0;
+const real dtau = 0.5;
 
-std::vector<float> floating_schedule = {
+std::vector<real> floating_schedule = {
         0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0,
         10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0, 
         19.5, 20.0, 20.5, 21.0, 21.5, 22.0, 22.5, 23.0, 23.5, 24.0, 24.5, 25.0
 };
 
-std::vector<float> fixed_schedule = {
+std::vector<real> fixed_schedule = {
         0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0,
         10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0,
         19.5, 20.0, 20.5, 21.0, 21.5, 22.0, 22.5, 23.0, 23.5, 24.0, 24.5, 25.0
@@ -183,22 +192,14 @@ bool get_arg(char** begin, char** end, const std::string& arg) {
 }
 
 
-void testSimulationCPU(float* exposure_curve, int exposuresCount, InterestRateSwap payOff, const float dt) {
-    //calculateExposureCPU<float>(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities.data(), exposuresCount, dt);
+void testSimulationCPU(real* exposure_curve, int exposuresCount, InterestRateSwap<real> payOff, const real dt) {
     calculateExposureCPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], exposuresCount, dt);
 }
 
 
-/*
-void testSimulationMultiGPU(float* exposure_curve, const int num_gpus, int scenarios, InterestRateSwap& payOff, const float dt) {
+void testSimulationMultiGPU(real* exposure_curve, const int num_gpus, int scenarios, InterestRateSwap<real>& payOff, real dt, real scale) {
 
-    calculateExposureMultiGPU(exposure_curve, payOff, accrual.data(), spot_rates, drifts, volatilities, num_gpus, scenarios, dt);
-}
-*/
-
-void testSimulationMultiGPU(double* exposure_curve, const int num_gpus, int scenarios, InterestRateSwap_D& payOff, const double dt, double scale) {
-
-    calculateExposureMultiGPU(exposure_curve, payOff, accrual_d.data(), spot_rates_d, drifts_d, volatilities_d, scale, num_gpus, scenarios, dt);
+    calculateExposureMultiGPU(exposure_curve, payOff, &accrual[0], &spot_rates[0], &drifts[0], &volatilities[0], scale, num_gpus, scenarios, dt);
 }
 
 
@@ -210,7 +211,8 @@ int main(int argc, char** argv)
 {
     int num_gpus = 0;            
     const int timepoints = 51;
-    InterestRateSwap payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.06700, expiry, dtau);
+
+    InterestRateSwap<real> payOff(&floating_schedule[0], &floating_schedule[0], &fixed_schedule[0], 10, 0.06700, expiry, dtau);
     InterestRateSwap_D payOff_d(&floating_schedule_d[0], &floating_schedule_d[0], &fixed_schedule_d[0], 10, 0.06700, expiry, dtau);
 
     std::cout << "valid arguments [-cpu|-single_gpu|-multigpu] -scenarios [number] -dt [0.01 - 0.001] -scale 1.0" << std::endl << std::endl;
@@ -222,37 +224,36 @@ int main(int argc, char** argv)
     }
 
     int scenarios = get_argval(argv, argv + argc, "-scenarios", 100000); 
-    float dt = get_argval(argv, argv + argc, "-dt", 0.01);
-    double scale = get_argval(argv, argv + argc, "-scale", 0.0);
+    real dt = get_argval(argv, argv + argc, "-dt", 0.01);
+    real scale = get_argval(argv, argv + argc, "-scale", 0.0);
 
     std::cout << "## scenarios " << scenarios << " simulations per scenarios: " << payOff_d.expiry/dt << "number of gpus: " << num_gpus << "dt: " << dt << std::endl;
     std::cout << "## scale" << scale << std::endl;
 
-    float* expected_exposure = (float*)malloc(51 * sizeof(float));
-    double* expected_exposure_d = (double*)malloc(51 * sizeof(double));
+#ifdef DOUBLE_PRECISION
+    double* expected_exposure = (double*)malloc(timepoints * sizeof(double));
+#else // SINGLE_PRECISION
+    float* expected_exposure = (float*)malloc(timepoints * sizeof(float));
+#endif
 
     if (num_gpus == 0) {
         std::cout << "## cpu measurements" << std::endl;
         testSimulationCPU(expected_exposure, scenarios, payOff, dt);
-         
-        printf("Expected Exposure Profile\n");
-        for (int t = 0; t < timepoints; t++) {
-            printf("%1.6f ", expected_exposure[t]);
-        }
     }
     else {
         std::cout << "## Gpu measurements for num_gpus: " << num_gpus << std::endl;
-        testSimulationMultiGPU(expected_exposure_d, num_gpus, scenarios, payOff_d, dt, scale);
-        printf("Expected Exposure Profile Double\n");
-        for (int t = 0; t < timepoints; t++) {
-            printf("%1.6f ", expected_exposure_d[t]);
-        }
-        printf("\n");
-        free(expected_exposure_d);
+        testSimulationMultiGPU(expected_exposure, num_gpus, scenarios, payOff, dt, scale);
     }
 
+    printf("Expected Exposure Profile Double\n");
+    for (int t = 0; t < timepoints; t++) {
+        printf("%1.6f ", expected_exposure[t]);
+    }
+    printf("\n");
+
     free(expected_exposure);
-    free(expected_exposure_d);
+
+    //free(expected_exposure_d);
 
     exit(0);
 }
