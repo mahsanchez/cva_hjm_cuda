@@ -58,11 +58,11 @@ using std::chrono::system_clock;
 #define OPT_SHARED_MEMORY1
 
 //#define DOUBLE_PRECISION
-//#define SINGLE_PRECISION
+#define SINGLE_PRECISION
 
-#define DOUBLE_PRECISION
-//#define SHARED_MEMORY_OPTIMIZATION
-#define CUDA_SYNCHR_OPTIMIZATION
+//#define DOUBLE_PRECISION
+#define SHARED_MEMORY_OPTIMIZATION
+//#define CUDA_SYNCHR_OPTIMIZATION
 
 //#define double double
 
@@ -148,6 +148,24 @@ void cudaMemsetValue(float* buffer, int N, float initial_value) {
  * where SDE dfbar =  m(t)*dt+SUM(Vol_i*phi[i]*SQRT(dt))+dF/dtau*dt and phi ~ N(0,1)
  */
 
+__device__  __forceinline__  float __musiela_sde2(float drift, float vol0, float vol1, float vol2, float phi0, float phi1, float phi2, float sqrt_dt, float dF, float rate0, float dtau, float dt) {
+    float vol_sum = vol0 * phi0;
+    vol_sum += vol1 * phi1;
+    vol_sum += vol2 * phi2;
+    vol_sum *= sqrtf(dt);
+
+    float dfbar = drift * dt;
+    dfbar += vol_sum;
+
+    dfbar += (dF / dtau) * dt;
+
+    // apply Euler Maruyana
+    double result = rate0 + dfbar;
+
+    return result;
+}
+
+template<typename real>
 __device__  __forceinline__  double __musiela_sde2(double drift, double vol0, double vol1, double vol2, double phi0, double phi1, double phi2, double sqrt_dt, double dF, double rate0, double dtau, double dt) {
     double vol_sum = vol0 * phi0;
     vol_sum += vol1 * phi1;
