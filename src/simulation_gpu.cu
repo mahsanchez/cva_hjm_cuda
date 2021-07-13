@@ -57,12 +57,14 @@ using std::chrono::system_clock;
 #define MULTI_GPU_SIMULATION1
 #define OPT_SHARED_MEMORY1
 
-//#define DOUBLE_PRECISION
-#define SINGLE_PRECISION
 
-//#define DOUBLE_PRECISION
+//#define SINGLE_PRECISION
+#define DOUBLE_PRECISION
 #define SHARED_MEMORY_OPTIMIZATION
 //#define CUDA_SYNCHR_OPTIMIZATION
+//#define MULTI_GPU_SIMULATION
+#define CUDA_SYNC
+
 
 //#define double double
 
@@ -621,7 +623,7 @@ void riskFactorSim4(
             dt
         );
 
-#ifndef CUDA_SYNCHR_OPTIMIZATION
+#ifdef CUDA_SYNC
         CUDA_RT_CALL(cudaDeviceSynchronize());
 #endif
 
@@ -660,7 +662,7 @@ void riskFactorSim4(
             dt
             );
 
-#ifndef CUDA_SYNCHR_OPTIMIZATION
+#ifdef CUDA_SYNC
         CUDA_RT_CALL(cudaDeviceSynchronize());
 #endif
         // update simulated rates (swap pointers)
@@ -833,7 +835,7 @@ void _exposure_calc_kernel(real* exposure, real2* numeraires, real notional, rea
     }
     __syncthreads();
 
-#ifdef EXPOSURE_PROFILES_DEBUG
+#ifdef EXPOSURE_PROFILES_DEBUG2
     if (threadIdx.x == 0) {
         for (int t = 0; t < TIMEPOINTS; t++) {
             printf("t - indext %d CashFlow %f \n", t, cash_flows[t]);
@@ -849,6 +851,7 @@ void _exposure_calc_kernel(real* exposure, real2* numeraires, real notional, rea
         }
         sum = (sum > 0.0) ? sum : 0.0;
         exposure[globaltid] = sum;
+
 #ifdef EXPOSURE_PROFILES_DEBUG
         printf("Block %d Thread %d Exposure %f \n", blockIdx.x, threadIdx.x, sum);
 #endif
@@ -896,7 +899,9 @@ void __expectedexposure_calc_kernel(float* expected_exposure, float* exposures, 
 
     CUBLAS_CALL(cublasSgemv(handle, CUBLAS_OP_N, cols, rows, &alpha, exposures, cols, d_x, 1, &beta, d_y, 1));
 
-    CUDA_RT_CALL( cudaMemcpy(expected_exposure, d_y, TIMEPOINTS * sizeof(float), cudaMemcpyDeviceToHost));
+#ifdef CUDA_SYNC
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+#endif
 
 #ifdef DEV_CURND_HOSTGEN1 
     printf("Exposure 2D Matrix Aggregation by Cols  \n");
@@ -916,7 +921,11 @@ void __expectedexposure_calc_kernel(double* expected_exposure, double* exposures
     // Apply matrix x identity vector (all 1) to do a column reduction by rows
     CUBLAS_CALL(cublasDgemv(handle, CUBLAS_OP_N, cols, rows, &alpha, exposures, cols, d_x, 1, &beta, d_y, 1));
 
-    CUDA_RT_CALL(cudaMemcpy(expected_exposure, d_y, TIMEPOINTS * sizeof(double), cudaMemcpyDeviceToHost));
+    //CUDA_RT_CALL(cudaMemcpy(expected_exposure, d_y, TIMEPOINTS * sizeof(double), cudaMemcpyDeviceToHost));
+
+#ifdef CUDA_SYNC
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+#endif
 
 #ifdef DEV_CURND_HOSTGEN1 
     printf("Exposure 2D Matrix Aggregation by Cols  \n");
@@ -929,240 +938,6 @@ void __expectedexposure_calc_kernel(double* expected_exposure, double* exposures
 
 /*
    Exposure Calculation Kernel Invocation
-*/
-/*
-void __calculateExposureMultiGPU(double* expected_exposure, InterestRateSwap<double> payOff, double* accrual, double* spot_rates, double* drifts, double* volatilities, double scale, const int num_gpus, int scenarios, double dt) {
-
-    std::vector<double*> rngNrmVar(num_gpus);
-    const int pathN = payOff.expiry / dt; // 25Y requires 2500 simulations
-    int scenarios_gpus = scenarios / num_gpus; // total work distribution across gpus
-    int rnd_count = scenarios_gpus * VOL_DIM * pathN;
-    const unsigned int seed = 1234ULL;
-    const double mean = 0.0;
-    const double _stddev = 1.0;
-    const int curveSizeBytes = TIMEPOINTS * sizeof(double); // Total memory occupancy for 51 timepoints
-
-    std::cout << scenarios_gpus << " " << num_gpus << " pathN" << pathN << " dt " << dt << std::endl;
-
-    // intermediate & final results memory reservation on device data
-    std::vector<double2*> d_numeraire(num_gpus);
-
-    std::vector<double*> d_exposures(num_gpus);
-    std::vector<double*> simulated_rates(num_gpus);
-    std::vector<double*> simulated_rates0(num_gpus);
-    std::vector<double*> accum_rates(num_gpus);
-    std::vector<double*> d_x(num_gpus);
-    std::vector<double*> d_y(num_gpus);  
-    std::vector<double*> partial_exposure(num_gpus);
-    //std::vector<curandState*> d_rngStates(num_gpus);
-    int nstreams = 16;
-    cudaStream_t* streams;
-
-    // memory allocation
-    for (int gpuDevice = 0; gpuDevice < num_gpus; gpuDevice++) {
-
-        cudaSetDevice(gpuDevice);
-
-        // Reserve on device memory structures
-        CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates[gpuDevice], scenarios_gpus * TIMEPOINTS * sizeof(double)));
-        CUDA_RT_CALL(cudaMalloc((void**)&simulated_rates0[gpuDevice], scenarios_gpus * TIMEPOINTS * sizeof(double)));
-        CUDA_RT_CALL(cudaMalloc((void**)&rngNrmVar[gpuDevice], rnd_count * sizeof(double)));
-
-        CUDA_RT_CALL(cudaMalloc((void**)&d_numeraire[gpuDevice], scenarios_gpus * TIMEPOINTS * sizeof(double2)));  // Numeraire (discount_factor, forward_rates)
-        CUDA_RT_CALL(cudaMalloc((void**)&d_exposures[gpuDevice], scenarios_gpus * TIMEPOINTS * sizeof(double)));   // Exposure profiles
-        CUDA_RT_CALL(cudaMalloc((void**)&accum_rates[gpuDevice], scenarios_gpus * TIMEPOINTS * sizeof(double)));
-        CUDA_RT_CALL(cudaMalloc((void**)&d_x[gpuDevice], scenarios_gpus * sizeof(double)));
-        CUDA_RT_CALL(cudaMalloc((void**)&d_y[gpuDevice], TIMEPOINTS * sizeof(double)));
-
-#ifdef STREAM_ACC
-        // allocate and initialize an array of stream handles
-        streams = (cudaStream_t*)malloc(nstreams * sizeof(cudaStream_t));
-        for (int i = 0; i < nstreams; i++)
-        {
-            CUDA_RT_CALL(cudaStreamCreate(&(streams[i])));
-        }
-#endif
-        // Reserve memory for ondevice random generation
-        //CUDA_RT_CALL(cudaMalloc((void**)&d_rngStates[gpuDevice], scenarios_gpus * BLOCK_SIZE * sizeof(curandState)));
-
-        partial_exposure[gpuDevice] = (double *) malloc(TIMEPOINTS * sizeof(double));
-        
-        // copy accrual, spot_rates, drifts, volatilites as marketData and copy to device constant memory
-        CUDA_RT_CALL(cudaMemcpyToSymbol(d_accrual, accrual, curveSizeBytes));
-        CUDA_RT_CALL(cudaMemcpyToSymbol(d_spot_rates, spot_rates, curveSizeBytes));
-        CUDA_RT_CALL(cudaMemcpyToSymbol(d_drifts, drifts, curveSizeBytes));
-        CUDA_RT_CALL(cudaMemcpyToSymbol(d_volatilities, volatilities, VOL_DIM * curveSizeBytes));
-
-        // initialize array structures
-        CUDA_RT_CALL(cudaMemset(accum_rates[gpuDevice], 0, scenarios_gpus * TIMEPOINTS * sizeof(double)));
-        CUDA_RT_CALL(cudaMemset(simulated_rates0[gpuDevice], 0, scenarios_gpus * TIMEPOINTS * sizeof(double)));
-        CUDA_RT_CALL(cudaMemset(d_y[gpuDevice], 0, TIMEPOINTS * sizeof(double)));
-        cudaMemsetValue(d_x[gpuDevice], scenarios_gpus, 1.0f);
-        
-    }
-
-    //  
-    ///free(x);
-
-    // random generation
-    nvtxRangePushA("random_generation");
-    #pragma omp parallel  num_threads(num_gpus)
-    {
-        int gpuDevice = omp_get_thread_num();
-
-        cudaSetDevice(gpuDevice);
-
-        // create Random Numbers (change seed by adding the gpuDevice)
-        unsigned long long offset = gpuDevice * rnd_count;
-        TIMED_RT_CALL(
-            initRNG2_kernel(rngNrmVar[gpuDevice], seed, offset, rnd_count, mean, _stddev), "normal variate generation"
-        );
-    }
-    nvtxRangePop();
-
-    // TRACE main
-    nvtxRangePushA("main");
-
-    // risk factor evolution
-    #pragma omp parallel num_threads(num_gpus)
-    {
-        int gpuDevice = omp_get_thread_num();
-
-        cudaSetDevice(gpuDevice);
-
-        // Kernel Execution Parameters
-        int N = 1;
-        int blockSize = N* BLOCK_SIZE;
-        int numberOfPoints = N * TIMEPOINTS;
-        int gridSize = scenarios_gpus / N;
-
-        nvtxRangePushA("RiskFactor_Simulation");
-
-        // Run Risk Factor Simulations Shared Memory Usage
-        TIMED_RT_CALL(
-           riskFactorSim4( //riskFactorSimShareMem
-            gridSize,
-            blockSize,
-            numberOfPoints,
-            d_numeraire[gpuDevice],
-            rngNrmVar[gpuDevice],
-            simulated_rates[gpuDevice],
-            simulated_rates0[gpuDevice],
-            accum_rates[gpuDevice],
-            pathN,
-            payOff.dtau,
-            dt
-           ),
-            "Execution Time Partial HJM MC simulation"
-        );
-
-        // TRACE main
-        nvtxRangePop();
-
-        nvtxRangePushA("Pricing");
-        // Exposure Profile Calculation  TODO (d_exposures + gpuDevice * TIMEPOINTS)
-        // Apply Scan algorithm here
-        TIMED_RT_CALL(
-            exposureCalculation(scenarios_gpus, BLOCK_SIZE, d_exposures[gpuDevice], d_numeraire[gpuDevice], payOff.notional, payOff.K, scenarios_gpus),
-            "exposure calculation"
-        );
-        nvtxRangePop();
-
-        //Replace all this block by a column reduction of the matrix
-        // Partial Expected Exposure Calculation and scattered across gpus
-        nvtxRangePushA("Aggregation");
-        cublasHandle_t handle; CUBLAS_CALL(cublasCreate(&handle));
-        TIMED_RT_CALL(
-             __expectedexposure_calc_kernel(partial_exposure[gpuDevice], d_exposures[gpuDevice], d_x[gpuDevice], d_y[gpuDevice], handle, scenarios_gpus),
-            "partial expected exposure profile"
-        );
-        nvtxRangePop();
-
-        // free up resources
-        if (handle) {
-           CUBLAS_CALL(cublasDestroy(handle));
-        }
-
-    }
-
-    // Replace all this block by a simple vector sum
-    // Gather the partial expected exposures and sum all
-    memset(expected_exposure, 0.0f, TIMEPOINTS * sizeof(double));
-
-    for (int gpuDevice = 1; gpuDevice < num_gpus; gpuDevice++) {
-#ifdef EXPECTED_EXPOSURE_DEBUG1
-        printf("Exposure Profile\n");
-        for (int t = 0; t < TIMEPOINTS; t++) {
-            printf("%1.4f ", partial_exposure[gpuDevice][t]);
-        }
-        printf("\n");
-#endif
-        vdAdd(TIMEPOINTS, partial_exposure[0], partial_exposure[gpuDevice], partial_exposure[0]);
-       
-    }  
-
-    double avg = 1.0f / (double) scenarios;
-
-    cblas_daxpy(TIMEPOINTS, avg, partial_exposure[0], 1, expected_exposure, 1);
-
-    // Scale back the results
-    if (scale > 0) {
-        for (int t = 0; t < TIMEPOINTS; t++) {
-            expected_exposure[t] = expected_exposure[t] / scale;
-        }
-    }
-    
-    // TRACE main
-    nvtxRangePop();
-
-    // free up resources
-    for (int gpuDevice = 0; gpuDevice < num_gpus; gpuDevice++) {
-
-        cudaSetDevice(gpuDevice);
-
-#ifdef STREAM_ACC
-        for (int i = 0; i < nstreams; i++)
-        {
-            CUDA_RT_CALL(cudaStreamDestroy(streams[i]));
-        }
-#endif
-
-        if (rngNrmVar[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(rngNrmVar[gpuDevice]));
-        }
-
-        if (d_numeraire[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(d_numeraire[gpuDevice]));
-        }
-
-        if (d_exposures[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(d_exposures[gpuDevice]));
-        }
-
-        if (simulated_rates[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(simulated_rates[gpuDevice]));
-        }
-
-        if (simulated_rates0[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(simulated_rates0[gpuDevice]));
-        }
-
-        if (accum_rates[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(accum_rates[gpuDevice]));
-        }
-        if (d_x[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(d_x[gpuDevice]));
-        }
-        if (d_y[gpuDevice]) {
-            CUDA_RT_CALL(cudaFree(d_y[gpuDevice]));
-        }
-
-        if (partial_exposure[gpuDevice]) {
-            free(partial_exposure[gpuDevice]);
-        }
-    }
- 
-}
 */
 
 template <typename real>
@@ -1202,6 +977,7 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
     std::vector<real*> d_x(num_gpus);
     std::vector<real*> d_y(num_gpus);
     std::vector<real*> partial_exposure(num_gpus);
+    std::vector<cublasHandle_t> cublas_handle(num_gpus);
     //std::vector<curandState*> d_rngStates(num_gpus);
 
 
@@ -1220,6 +996,8 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
         CUDA_RT_CALL(cudaMalloc((void**)&accum_rates[gpuDevice], scenarios_gpus * TIMEPOINTS * sizeof(real)));
         CUDA_RT_CALL(cudaMalloc((void**)&d_x[gpuDevice], scenarios_gpus * sizeof(real)));
         CUDA_RT_CALL(cudaMalloc((void**)&d_y[gpuDevice], TIMEPOINTS * sizeof(real)));
+
+        CUBLAS_CALL(cublasCreate(&cublas_handle[gpuDevice]));
 
 #ifdef STREAM_ACC
         // allocate and initialize an array of stream handles
@@ -1252,12 +1030,19 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
     //  
     ///free(x);
 
+    // GPU Computation
+    nvtxRangePush("gpu_computation");
+
     // random generation
-    nvtxRangePushA("random_generation");
+    nvtxRangePush("random_generation");
+
+#ifdef MULTI_GPU_SIMULATION
 #pragma omp parallel  num_threads(num_gpus)
     {
         int gpuDevice = omp_get_thread_num();
-
+#else
+        int gpuDevice = 0;
+#endif
         cudaSetDevice(gpuDevice);
 
         // create Random Numbers (change seed by adding the gpuDevice)
@@ -1265,17 +1050,17 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
         TIMED_RT_CALL(
             initRNG2_kernel(rngNrmVar[gpuDevice], seed, offset, rnd_count, mean, _stddev), "normal variate generation"
         );
+#ifdef MULTI_GPU_SIMULATION
     }
+#endif
     nvtxRangePop();
 
-    // TRACE main
-    nvtxRangePushA("main");
-
     // risk factor evolution
+#ifdef MULTI_GPU_SIMULATION
 #pragma omp parallel num_threads(num_gpus)
     {
         int gpuDevice = omp_get_thread_num();
-
+#endif
         cudaSetDevice(gpuDevice);
 
         // Kernel Execution Parameters
@@ -1284,11 +1069,11 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
         int numberOfPoints = N * TIMEPOINTS;
         int gridSize = scenarios_gpus / N;
 
-        nvtxRangePushA("RiskFactor_Simulation");
+        nvtxRangePush("Simulation");
 
 #ifdef SHARED_MEMORY_OPTIMIZATION
         TIMED_RT_CALL(
-            riskFactorSim4( //riskFactorSimShareMem
+            riskFactorSim4( 
                 gridSize,
                 blockSize,
                 numberOfPoints,
@@ -1324,7 +1109,7 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
         // TRACE main
         nvtxRangePop();
 
-        nvtxRangePushA("Pricing");
+        nvtxRangePush("Pricing");
         // Exposure Profile Calculation  TODO (d_exposures + gpuDevice * TIMEPOINTS)
         // Apply Scan algorithm here
         TIMED_RT_CALL(
@@ -1335,42 +1120,46 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
 
         //Replace all this block by a column reduction of the matrix
         // Partial Expected Exposure Calculation and scattered across gpus
-        nvtxRangePushA("Aggregation");
-        cublasHandle_t handle; CUBLAS_CALL(cublasCreate(&handle));
+        nvtxRangePushA("Exposure");
+        
         TIMED_RT_CALL(
-            __expectedexposure_calc_kernel(partial_exposure[gpuDevice], d_exposures[gpuDevice], d_x[gpuDevice], d_y[gpuDevice], handle, scenarios_gpus),
+            __expectedexposure_calc_kernel(partial_exposure[gpuDevice], d_exposures[gpuDevice], d_x[gpuDevice], d_y[gpuDevice], cublas_handle[gpuDevice], scenarios_gpus),
             "partial expected exposure profile"
         );
         nvtxRangePop();
 
-        // free up resources
-        if (handle) {
-            CUBLAS_CALL(cublasDestroy(handle));
-        }
-
+#ifdef MULTI_GPU_SIMULATION
     }
+#endif
 
-    // Replace all this block by a simple vector sum
-    // Gather the partial expected exposures and sum all
+    nvtxRangePop();
+
+    // collect partial results and reduce them
     memset(expected_exposure, 0.0f, TIMEPOINTS * sizeof(real));
+    CUDA_RT_CALL(cudaMemcpy(partial_exposure[0], d_y[0], TIMEPOINTS * sizeof(real), cudaMemcpyDeviceToHost));
 
+#ifdef MULTI_GPU_SIMULATION
     for (int gpuDevice = 1; gpuDevice < num_gpus; gpuDevice++) {
-#ifdef EXPECTED_EXPOSURE_DEBUG1
+
+        CUDA_RT_CALL(cudaMemcpy(partial_exposure[gpuDevice], d_y[gpuDevice], TIMEPOINTS * sizeof(real), cudaMemcpyDeviceToHost));
+
+#ifdef EXPECTED_EXPOSURE_DEBUG
         printf("Exposure Profile\n");
         for (int t = 0; t < TIMEPOINTS; t++) {
             printf("%1.4f ", partial_exposure[gpuDevice][t]);
         }
         printf("\n");
 #endif
+
         vAdd(TIMEPOINTS, partial_exposure[0], partial_exposure[gpuDevice], partial_exposure[0]);
-
     }
+#endif
 
+    // average the result partial summation of exposure profiles
     real avg = 1.0f / (real)scenarios;
     saxpy(TIMEPOINTS, avg, partial_exposure[0], expected_exposure);
 
     // TRACE main
-    nvtxRangePop();
 
     // free up resources
     for (int gpuDevice = 0; gpuDevice < num_gpus; gpuDevice++) {
@@ -1383,6 +1172,8 @@ void __calculateExposureMultiGPU(real* expected_exposure, InterestRateSwap<real>
             CUDA_RT_CALL(cudaStreamDestroy(streams[i]));
         }
 #endif
+
+        CUBLAS_CALL(cublasDestroy( cublas_handle[gpuDevice] ));
 
         if (rngNrmVar[gpuDevice]) {
             CUDA_RT_CALL(cudaFree(rngNrmVar[gpuDevice]));

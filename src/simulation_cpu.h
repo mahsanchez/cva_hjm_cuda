@@ -389,6 +389,9 @@ void calculateExposureCPU(real* _expected_exposure, InterestRateSwap<real> payOf
     real* rngNrmVar = 0;
     rngNrmVar = (real*)malloc(rnd_count * sizeof(real));
 
+    // global computation time
+    auto gt_start = std::chrono::high_resolution_clock::now();
+
     // Normal distributed variates generation
     auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -454,6 +457,9 @@ void calculateExposureCPU(real* _expected_exposure, InterestRateSwap<real> payOf
     t_end = std::chrono::high_resolution_clock::now();
     elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     std::cout << "total time taken to run" << exposuresCount << " expected exposure profile " << elapsed_time_ms << "(ms)" << std::endl;
+
+    auto gt_end = std::chrono::high_resolution_clock::now();
+    std::cout << "global time taken to run" << std::chrono::duration<double, std::milli>(gt_end - gt_start).count() << "(ms)" << std::endl;
 
 #ifdef DEBUG_NUMERAIRE
     printf("Forward Rates/ Discount Factors \n");
