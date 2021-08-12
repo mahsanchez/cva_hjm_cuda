@@ -1,0 +1,9 @@
+Parallelize sequential CPU code with OpenMP (2, 4, 8, 16 cores)
+Generate Random Values with cuRAND ondevice API
+Instrument the generated MC paths to calculate sensitivities with AAD 
+Uses C++ to wrap the CUDA kernel code invocation
+Uses CUDA Streams to better use the SM
+Refine more the CVA model
+Uses fixed point (ADA) to improve floating point accuracy 
+Uses new NVIDIA Tensor Cores in V100 to speed up parallel reduction and parallel prefix sum with cuBLAS
+Uses CUDA Events to calculate the kernel execution time
