@@ -1,3 +1,4 @@
+Use CMake to compile and build the code for Windows and Linux 
 Parallelize sequential CPU code with OpenMP (2, 4, 8, 16 cores)
 Generate Random Values with cuRAND ondevice API
 Instrument the generated MC paths to calculate sensitivities with AAD 
