@@ -10,3 +10,4 @@ Uses fixed point (ADA) to improve floating point accuracy
 Uses new NVIDIA Tensor Cores in V100 to speed up parallel reduction and parallel prefix sum with cuBLAS
 Uses CUDA Events to calculate the kernel execution time
 Add the volatility and drift for HJM model calibration 
+Calculate sensitivities using Pathwise Method (AAD)
