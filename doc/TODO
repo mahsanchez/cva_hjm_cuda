@@ -2,6 +2,7 @@ Use CMake to compile and build the code for Windows and Linux
 Parallelize sequential CPU code with OpenMP (2, 4, 8, 16 cores)
 Use Predictor corrector to evolve the Musiela SDE MC Path
 Generate Random Values with cuRAND ondevice API
+Try different random number generators
 Instrument the generated MC paths to calculate sensitivities with AAD 
 Uses C++ to wrap the CUDA kernel code invocation
 Uses CUDA Streams to better use the SM
