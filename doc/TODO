@@ -6,9 +6,10 @@ Try different random number generators
 Instrument the generated MC paths to calculate sensitivities with AAD 
 Uses C++ to wrap the CUDA kernel code invocation
 Uses CUDA Streams to better use the SM
-Refine more the CVA model
+Refine more the CVA model with C++ class design
 Uses fixed point (ADA) to improve floating point accuracy 
 Uses new NVIDIA Tensor Cores in V100 to speed up parallel reduction and parallel prefix sum with cuBLAS
 Uses CUDA Events to calculate the kernel execution time
 Add the volatility and drift for HJM model calibration 
 Calculate sensitivities using Pathwise Method (AAD)
+Implement multi0level monte Carlo
