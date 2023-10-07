@@ -11,5 +11,6 @@ fixed income pricing library as a quant
 *  MBS modelling and integration into OTC risk (xVA, CVA, ...)
 *  Risk based PnL across Fixed Income assets
 *  C++ and Python
+*  NVIDIA CUDA C++ GPU Acceleration, Thrust
 *  deploy flows and quant library using AWS Cloud Services
 *  cover pre-trade to core analytics
